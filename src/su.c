@@ -556,6 +556,21 @@ static int selinux_ctx_known(const char *ctx)
 	for (i = 0; i < sizeof(SELINUX_KNOWN_EXTRA_CTX)/sizeof(SELINUX_KNOWN_EXTRA_CTX[0]); i++)
 		if (strcmp(SELINUX_KNOWN_EXTRA_CTX[i], ctx) == 0)
 			return 1;
+	/* The untrusted_app_NN family is chosen by the device policy from
+	 * minTargetSdkVersion, and the numbers are device specific -- 30/29/27/25
+	 * here.  Accept any of them: a hardcoded list made an explicit
+	 * -Z u:r:untrusted_app_30:s0 fail with "domain does not exist" while
+	 * the default path produced exactly that context.  Being a little
+	 * permissive here costs nothing, because the per-uid check in
+	 * selinux_ctx_gate_uid() is what actually narrows -Z. */
+	if (strncmp(ctx, "u:r:untrusted_app_", 18) == 0) {
+		const char *p = ctx + 18;
+		if (*p >= '0' && *p <= '9') {
+			while (*p >= '0' && *p <= '9')
+				p++;
+			return strcmp(p, ":s0") == 0;
+		}
+	}
 	return 0;
 }
 /* Accept a full u:r:<domain>:s0 string or a bare known name (e.g. "shell",

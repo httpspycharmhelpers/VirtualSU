@@ -121,6 +121,12 @@ static int translate_path2(Tracee *tracee, int dir_fd, char path[PATH_MAX], Reg 
 }
 
 extern char g_work_dir[PATH_MAX];
+/* The session's chosen context lives in the su process itself.  Reading it
+ * back out of <workdir>/ctx made it per-*file*, and since every session
+ * shares one workdir the second su overwrote the first one's context:
+ * a uid 2000 session would report u:r:system_app:s0 because a uid 1000
+ * session had started in between.  Prefer the in-process value. */
+extern const char *g_selinux_ctx;
 /* Second cache location; see g_alt_cache in su.c. */
 extern char g_alt_cache[PATH_MAX];
 
@@ -367,6 +373,12 @@ static const char *afakesu_read_session_ctx(void)
 
 	if (loaded)
 		return ctx;
+
+	if (g_selinux_ctx != NULL && g_selinux_ctx[0] != '\0') {
+		snprintf(ctx, sizeof(ctx), "%s", g_selinux_ctx);
+		loaded = true;
+		return ctx;
+	}
 
 	snprintf(ctx_path, sizeof(ctx_path), "%s/ctx", g_work_dir);
 	f = fopen(ctx_path, "r");
