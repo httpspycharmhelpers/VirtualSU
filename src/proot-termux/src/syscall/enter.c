@@ -121,6 +121,8 @@ static int translate_path2(Tracee *tracee, int dir_fd, char path[PATH_MAX], Reg 
 }
 
 extern char g_work_dir[PATH_MAX];
+/* Second cache location; see g_alt_cache in su.c. */
+extern char g_alt_cache[PATH_MAX];
 
 /* AFAKESU: the kernel denies readlink("/proc/1/exe") to a shell
  * domain, but a root masquerade should resolve init's exe.  PRoot's
@@ -430,7 +432,14 @@ static void afakesu_regen_status_for_pid(pid_t pid)
 	grps[0] = '\0';
 	{
 		char gp[PATH_MAX];
-		snprintf(gp, sizeof(gp), "%s/.ugroups", g_work_dir);
+		/* The workdir moves with the installed binary, so try the shared
+		 * cache location too before giving up: an unread .ugroups is what
+		 * left the Groups line empty for every uid except root. */
+		for (int ci = 0; ci < 2 && grps[0] == '\0'; ci++) {
+		const char *cbase = (ci == 0) ? g_work_dir : g_alt_cache;
+		if (cbase == NULL || cbase[0] == '\0')
+			continue;
+		snprintf(gp, sizeof(gp), "%s/.ugroups", cbase);
 		FILE *gf = fopen(gp, "r");
 		if (gf != NULL) {
 			while (fgets(line, sizeof(line), gf) != NULL) {
@@ -460,6 +469,7 @@ static void afakesu_regen_status_for_pid(pid_t pid)
 				break;
 			}
 			fclose(gf);
+		}
 		}
 	}
 	if (uid == 0 && grps[0] == '\0')

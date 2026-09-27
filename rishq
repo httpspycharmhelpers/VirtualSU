@@ -5,7 +5,11 @@
 #
 # 用法: rishq '<设备端命令>' [看门狗秒数]
 #
-set -u
+# NOT set -u: an unbound-variable abort prints this script's absolute
+# Termux path on stderr, and su hands that stderr to the guest, which
+# both aborts the query and leaks the host path.  Guard the few
+# variables that actually matter instead.
+set -o pipefail
 
 D="$(cd "$(dirname "$0")" && pwd)"
 CMD="$1"
@@ -30,7 +34,9 @@ disarm_wd() {
 # 读直到出现标记 (含标记前累积输出)
 read_until() {
     local mark="$1" line out=""
-    while IFS= read -r -u "${RISH[0]}" line; do
+    local rfd="${RISH[0]:-}"
+    [ -n "$rfd" ] || return 1
+    while IFS= read -r -u "$rfd" line; do
         case "$line" in
             *"$mark"*) printf '%s' "$out"; return 0 ;;
             *) out+="$line"$'\n' ;;

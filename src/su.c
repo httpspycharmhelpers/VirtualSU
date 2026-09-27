@@ -39,6 +39,7 @@ extern const unsigned char _binary_libncursesw_so_6_5_end[];
 #define GUEST_PATH GUEST_BIN_DIR ":/sbin:/system/sbin:/system/bin:/system/xbin:/vendor/bin"
 #define INT_MAX_VALUE 2147483647
 #define WORK_DIR_NAME ".tmp"
+#define CACHE_DIR_NAME ".aFakeSU"
 #define REAL_FILE "real_uids.txt"
 #define RISHQ_NAME "rishq"
 #define FACTS_DEX_NAME "facts.dex"
@@ -46,6 +47,13 @@ extern const unsigned char _binary_libncursesw_so_6_5_end[];
 static char g_self_exe[PATH_MAX];
 static char g_self_dir[PATH_MAX];
 char g_work_dir[PATH_MAX];
+/* A second, location-independent place to look for (and keep) the L0
+ * caches.  g_work_dir is derived from the running binary's own path, and
+ * the same binary is installed at more than one path (/data/local/tmp and
+ * the Termux prefix), so the caches harvested by one copy are invisible to
+ * the other: .ugroups went unread and /proc/self/status came back with an
+ * empty Groups line.  Readers try the workdir first, then this. */
+char g_alt_cache[PATH_MAX];
 char g_proot_argv0[64];
 int g_proot_argv0_fix = 0;
 static const char *g_fake_name = "sh";
@@ -913,8 +921,16 @@ static void aid_real_patch(void)
 		return;
 	}
 	if (out != NULL) {
+		/* One line per uid, and it must be the same line on every harvest:
+		 * a uid can have several live processes with different group sets
+		 * (uid 0 had six, uid 2000 had three), so "keep the first" made the
+		 * answer depend on harvest order.  The most frequent set wins. */
+		struct { long uid; char g[256]; int n; } best[512];
+		int nb = 0;
 		char *save = NULL;
 		for (char *line = strtok_r(out, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
+			if (strncmp(line, "999999999:", 10) == 0)
+				continue;
 			char *colon = strchr(line, ':');
 			if (colon == NULL)
 				continue;
@@ -925,10 +941,32 @@ static void aid_real_patch(void)
 			char *g = colon + 1;
 			while (*g == ' ' || *g == '\t')
 				g++;
-			/* Keep the first occurrence per uid. */
-			if (strncmp(line, "999999999:", 10) == 0)
+			int i;
+			for (i = 0; i < nb; i++)
+				if (best[i].uid == u && strcmp(best[i].g, g) == 0) {
+					best[i].n++;
+					break;
+				}
+			if (i < nb)
 				continue;
-			fprintf(f, "%ld:%s\n", u, g);
+			if (nb >= (int)(sizeof(best) / sizeof(best[0])))
+				continue;
+			best[nb].uid = u;
+			snprintf(best[nb].g, sizeof(best[nb].g), "%s", g);
+			best[nb].n = 1;
+			nb++;
+		}
+		for (int i = 0; i < nb; i++) {
+			int bi = i;
+			for (int k = i + 1; k < nb; k++)
+				if (best[k].n > best[bi].n)
+					bi = k;
+			if (bi != i) {
+				typeof(best[0]) tmp = best[i];
+				best[i] = best[bi];
+				best[bi] = tmp;
+			}
+			fprintf(f, "%ld:%s\n", best[i].uid, best[i].g);
 		}
 	}
 	fclose(f);
@@ -1961,17 +1999,52 @@ static int rishq_query(const char *cmd, char **out, size_t *outlen)
 	 * deadline even though the compiled-in baseline had the answer. */
 	if (rishq_broken)
 		return -1;
+	/* rishq sits next to whichever copy of the binary is running, and the
+	 * binary is installed at more than one path.  Looking only in the
+	 * binary's own directory made the harvest fail silently for every copy
+	 * but one: no rishq, no exception, no caches, and the session then ran
+	 * with empty device facts.  Look in all three known places. */
+	const char *qdirs[3];
+	qdirs[0] = g_self_dir;
+	qdirs[1] = g_work_dir;
+	qdirs[2] = g_alt_cache;
 	char rishq_path[PATH_MAX];
-	snprintf(rishq_path, sizeof(rishq_path), "%s/%s", g_self_dir, RISHQ_NAME);
+	rishq_path[0] = '\0';
 	struct stat st;
-	if (stat(rishq_path, &st) != 0) {
+	for (int i = 0; i < 3 && rishq_path[0] == '\0'; i++) {
+		if (qdirs[i] == NULL || qdirs[i][0] == '\0')
+			continue;
+		char cand[PATH_MAX];
+		snprintf(cand, sizeof(cand), "%s/%s", qdirs[i], RISHQ_NAME);
+		if (stat(cand, &st) == 0)
+			snprintf(rishq_path, sizeof(rishq_path), "%s", cand);
+	}
+	if (rishq_path[0] == '\0') {
 		rishq_broken = 1;
 		return -1;
 	}
+	/* Publish it into the shared cache, so a copy of the binary sitting
+	 * somewhere else can still harvest on its first run. */
+	if (g_alt_cache[0] != '\0' &&
+	    strncmp(rishq_path, g_alt_cache, strlen(g_alt_cache)) != 0) {
+		mkdir(g_alt_cache, 0700);
+		char pub[PATH_MAX];
+		snprintf(pub, sizeof(pub), "%s/%s", g_alt_cache, RISHQ_NAME);
+		(void)unlink(pub);
+		(void)link(rishq_path, pub);
+	}
 	char bash_path[PATH_MAX];
-	snprintf(bash_path, sizeof(bash_path), "%s/bash", g_work_dir);
+	bash_path[0] = '\0';
+	for (int i = 0; i < 3 && bash_path[0] == '\0'; i++) {
+		if (qdirs[i] == NULL || qdirs[i][0] == '\0')
+			continue;
+		char cand[PATH_MAX];
+		snprintf(cand, sizeof(cand), "%s/bash", qdirs[i]);
+		if (stat(cand, &st) == 0)
+			snprintf(bash_path, sizeof(bash_path), "%s", cand);
+	}
 	int rc;
-	if (stat(bash_path, &st) == 0)
+	if (bash_path[0] != '\0')
 		rc = run_cmd_capture_argv(bash_path, rishq_path, cmd, out, outlen);
 	else
 		rc = run_cmd_capture(rishq_path, cmd, out, outlen);
@@ -2369,6 +2442,47 @@ static void aid_files_setup(void)
 	fclose(fp);
 	fclose(fg);
 }
+/* Rewrite a passwd/group style file keeping one copy of each line, so a
+ * file that is only ever appended to cannot grow without bound. */
+static void dedupe_passwd_file(const char *path, long keep_uid, long keep_gid)
+{
+	FILE *f = fopen(path, "r");
+	if (f == NULL)
+		return;
+	char seen[512][256];
+	int ns = 0;
+	char line[4096];
+	while (ns < 512 && fgets(line, sizeof(line), f) != NULL) {
+		size_t l = strlen(line);
+		while (l > 0 && (line[l - 1] == '\n' || line[l - 1] == '\r'))
+			line[--l] = '\0';
+		if (l == 0)
+			continue;
+		int dup = 0;
+		for (int i = 0; i < ns; i++)
+			if (strcmp(seen[i], line) == 0) {
+				dup = 1;
+				break;
+			}
+		if (dup)
+			continue;
+		snprintf(seen[ns++], sizeof(seen[0]), "%s", line);
+	}
+	fclose(f);
+	if (ns == 0)
+		return;
+	char tmp[PATH_MAX];
+	snprintf(tmp, sizeof(tmp), "%s.dedup", path);
+	FILE *o = fopen(tmp, "w");
+	if (o == NULL)
+		return;
+	for (int i = 0; i < ns; i++)
+		fprintf(o, "%s\n", seen[i]);
+	fclose(o);
+	rename(tmp, path);
+	(void)keep_uid;
+	(void)keep_gid;
+}
 static void ensure_current_uid_in_files(void)
 {
 	if (g_uid <= 0 || g_gid <= 0)
@@ -2389,14 +2503,35 @@ static void ensure_current_uid_in_files(void)
 		}
 		fclose(f);
 	}
+	char pw[PATH_MAX];
+	snprintf(pw, sizeof(pw), "%s/etc_passwd", g_work_dir);
+
+	/* Both files were checked through the group's "found" flag, so a uid
+	 * whose gid was already listed never got its passwd line: getpwuid
+	 * then failed and `id` / `whoami` printed nothing.  Check each file on
+	 * its own. */
 	if (!found) {
 		FILE *fg = fopen(gr, "a");
 		if (fg) {
 			fprintf(fg, "gid_%ld:x:%ld:\n", g_gid, g_gid);
 			fclose(fg);
 		}
-		char pw[PATH_MAX];
-		snprintf(pw, sizeof(pw), "%s/etc_passwd", g_work_dir);
+	}
+	found = false;
+	FILE *fchk = fopen(pw, "r");
+	if (fchk) {
+		char l2[4096];
+		char buf[64];
+		snprintf(buf, sizeof(buf), "user_%ld:x:", g_uid);
+		while (fgets(l2, sizeof(l2), fchk)) {
+			if (strncmp(l2, buf, strlen(buf)) == 0) {
+				found = true;
+				break;
+			}
+		}
+		fclose(fchk);
+	}
+	if (!found) {
 		FILE *fp = fopen(pw, "a");
 		if (fp) {
 			fprintf(fp, "user_%ld:x:%ld:%ld:User %ld:/data/user/0:/system/bin/sh\n",
@@ -2404,6 +2539,14 @@ static void ensure_current_uid_in_files(void)
 			fclose(fp);
 		}
 	}
+
+	/* Both files are opened in append mode and nothing ever removed a
+	 * line, so every distinct uid ever used left a permanent entry behind
+	 * and the pair grew without bound.  Collapse duplicates in place, and
+	 * keep only the well-known AIDs plus the lines this session needs, so
+	 * the files stay a fixed size no matter how many uids are tried. */
+	dedupe_passwd_file(pw, g_uid, g_gid);
+	dedupe_passwd_file(gr, g_uid, g_gid);
 }
 static void linker_config_setup(void)
 {
@@ -2932,6 +3075,57 @@ static void gen_build_prop(void)
 	chmod(dst, 0644);
 }
 
+/* Several su sessions can share one workdir, and the second one starting
+ * used to delete the first one's bin/ and ctx out from under it: the guest
+ * then had no wrapper directory and no context file, so commands vanished
+ * and paths came out as /system/bin//id or "not found".  That is what made
+ * an idle session start failing.  Track the live pids and leave a running
+ * session's files alone; the next solo run still cleans up. */
+static void sess_mark(void)
+{
+	char d[PATH_MAX], f[PATH_MAX];
+	snprintf(d, sizeof(d), "%s/.sessions", g_work_dir);
+	mkdir(d, 0700);
+	snprintf(f, sizeof(f), "%s/%ld", d, (long)getpid());
+	FILE *fp = fopen(f, "w");
+	if (fp != NULL) {
+		fputs("1\n", fp);
+		fclose(fp);
+	}
+}
+static void sess_unmark(void)
+{
+	char d[PATH_MAX], f[PATH_MAX];
+	snprintf(d, sizeof(d), "%s/.sessions", g_work_dir);
+	snprintf(f, sizeof(f), "%s/%ld", d, (long)getpid());
+	unlink(f);
+}
+static int other_live_sessions(void)
+{
+	char d[PATH_MAX], f[PATH_MAX];
+	snprintf(d, sizeof(d), "%s/.sessions", g_work_dir);
+	DIR *dp = opendir(d);
+	if (dp == NULL)
+		return 0;
+	struct dirent *e;
+	long me = (long)getpid();
+	int n = 0;
+	while ((e = readdir(dp)) != NULL) {
+		if (e->d_name[0] == '.')
+			continue;
+		long other = atol(e->d_name);
+		if (other <= 0 || other == me)
+			continue;
+		snprintf(f, sizeof(f), "%s/%s", d, e->d_name);
+		errno = 0;
+		if (kill((pid_t)other, 0) == 0 || errno == EPERM)
+			n++;
+		else
+			unlink(f);	/* crashed earlier: drop the stale marker */
+	}
+	closedir(dp);
+	return n;
+}
 static void cleanup_workdir(void)
 {
 	/* A real su leaves nothing behind: drop every runtime artifact the
@@ -2940,7 +3134,9 @@ static void cleanup_workdir(void)
 	 * dot-prefixed cache files stay invisible to a plain `ls` anyway. */
 	if (g_work_dir[0] == '\0')
 		return;
-	static const char *keep[] = { ".usermap", ".ugroups", ".xattrs", ".policy",
+	if (other_live_sessions() > 0)
+		return;
+	static const char *keep[] = { ".sessions", ".usermap", ".ugroups", ".xattrs", ".policy",
 		SEAPP_FILE, APPTAB_FILE,
 				      ".props", ".propsmod", NULL };
 	DIR *d = opendir(g_work_dir);
@@ -3605,6 +3801,9 @@ static void parse_options(int argc, char **argv)
 int main(int argc, char **argv)
 {
 	atexit(cleanup_workdir);
+	/* Registered after cleanup_workdir so it runs first: drop our own
+	 * marker, then let cleanup decide whether anyone else is left. */
+	atexit(sess_unmark);
 	if (argc > 0 && argv[0] != NULL) {
 		size_t alen = strlen(argv[0]);
 		if (alen > 1)
@@ -3639,10 +3838,19 @@ int main(int argc, char **argv)
 		strcpy(g_self_dir, ".");
 	}
 	snprintf(g_work_dir, sizeof(g_work_dir), "%s/%s", g_self_dir, WORK_DIR_NAME);
+	/* Keep the shared caches beside the workdir when the binary lives in the
+	 * Termux prefix (that tree is private to the app); otherwise fall back to
+	 * the shell-writable /data/local/tmp.  Either way the reader has two
+	 * places to try, so a harvest made by one install is still found. */
+	if (strncmp(g_self_dir, "/data/local/tmp", 15) == 0)
+		snprintf(g_alt_cache, sizeof(g_alt_cache), "/data/local/tmp/%s", CACHE_DIR_NAME);
+	else
+		snprintf(g_alt_cache, sizeof(g_alt_cache), "%s/%s", g_self_dir, CACHE_DIR_NAME);
 	mkdir(g_work_dir, 0700);
 	chmod(g_work_dir, 0700);
 	/* Wipe stale artifacts of a previous (possibly crashed) session before
 	 * staging this one; caches (.usermap/.ugroups/.xattrs) survive. */
+	sess_mark();
 	cleanup_workdir();
 	ensure_bash();
 	ensure_libs();
