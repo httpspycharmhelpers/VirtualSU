@@ -472,8 +472,17 @@ static void afakesu_regen_status_for_pid(pid_t pid)
 		}
 		}
 	}
-	if (uid == 0 && grps[0] == '\0')
+	/* AOSP su calls setgroups() before it drops to root, so a real root
+	 * shell ends up carrying group 0 and nothing else -- init's own 3009
+	 * is not what a su session has.  The harvested list describes
+	 * processes that did NOT come from su (init, system_server, ...), so
+	 * uid 0 must not borrow it.  A kernel-root session likewise keeps
+	 * whatever the exploited process already had rather than gaining a
+	 * reset, which is why this is scoped to uid 0. */
+	if (uid == 0) {
+		grps[0] = '\0';
 		strcpy(grps, "0");
+	}
 
 	const char *ctx = afakesu_read_session_ctx();
 	if (ctx == NULL)

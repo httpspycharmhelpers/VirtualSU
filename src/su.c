@@ -1625,8 +1625,12 @@ static const char *selinux_ctx_for_user(const char *user)
 		if (valid_uint_str(name, &u) && aid_name_for_uid(u, namebuf, sizeof(namebuf)))
 			name = namebuf;
 	}
+	/* AOSP su -- and Magisk su, which is what this tool follows -- put the
+	 * root shell in the su domain.  kernel:s0 is what uid 0's *other*
+	 * processes (init and friends) wear, not what a su session wears, so
+	 * borrowing it here would be the tell. */
 	if (name == NULL || name[0] == '\0' || strcmp(name, "root") == 0)
-		return "u:r:kernel:s0";
+		return "u:r:su:s0";
 	if (strcmp(name, "shell") == 0)
 		return "u:r:shell:s0";
 
