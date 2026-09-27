@@ -41,6 +41,8 @@ extern const unsigned char _binary_libncursesw_so_6_5_end[];
 #define WORK_DIR_NAME ".tmp"
 #define REAL_FILE "real_uids.txt"
 #define RISHQ_NAME "rishq"
+#define FACTS_DEX_NAME "facts.dex"
+#define APP_PROCESS "/system/bin/app_process"
 static char g_self_exe[PATH_MAX];
 static char g_self_dir[PATH_MAX];
 char g_work_dir[PATH_MAX];
@@ -66,7 +68,10 @@ static bool g_mount = false;
  * capability for the session, so a capability probe sees an unprivileged
  * root rather than a fully capable one. */
 static bool g_interactive = false;
-static bool g_drop_cap = false;
+/* Not static: proot's enter.c rewrites /proc/<pid>/status on every read and
+ * needs the same flag, otherwise --drop-cap changes the file we generate
+ * but not the one the session actually reads. */
+int g_drop_cap = false;
 /* Set from -i and consumed by build_and_run_proot(). */
 static bool force_pty = false;
 
@@ -467,7 +472,10 @@ static const struct { const char *user; const char *ctx; } AID_SELINUX_CTX[] = {
 	{ "root", "u:r:kernel:s0" },
 	{ "system", "u:r:system_app:s0" },
 	{ "radio", "u:r:radio:s0" },
-	{ "bluetooth", "u:r:mtk_hal_bluetooth:s0" },
+	/* The device policy says "user=bluetooth seinfo=platform domain=bluetooth";
+	 * the old mtk_hal_bluetooth label was a guess that no seapp rule
+	 * backs. */
+	{ "bluetooth", "u:r:bluetooth:s0" },
 	{ "wifi", "u:r:wificond:s0" },
 	{ "media", "u:r:mediametrics:s0" },
 	{ "keystore", "u:r:keystore:s0" },
@@ -487,6 +495,8 @@ static const struct { const char *user; const char *ctx; } AID_SELINUX_CTX[] = {
 	{ "adb", "u:r:adbd:s0" },
 	{ "dhcp", "u:r:dhcp:s0" },
 	{ "nfc", "u:r:nfc:s0" },
+	{ "secure_element", "u:r:secure_element:s0" },
+	{ "webview_zygote", "u:r:webview_zygote:s0" },
 	{ "mtp", "u:r:mtp:s0" },
 	{ "clat", "u:r:clatd:s0" },
 	{ "mediadrm", "u:r:mediadrm:s0" },
@@ -544,6 +554,125 @@ static int selinux_ctx_known(const char *ctx)
  * "radio"), normalize it, and hard-fail if the domain is not one this device
  * could actually carry.  Rejects any non-sepolicy character (no "/", spaces,
  * newlines) so the ctx file can never be corrupted via injection. */
+/* ---- per-uid observed SELinux domains -------------------------------
+ *
+ * The policy file gives one domain per AID, but that is not the whole
+ * truth on this device: uid 1002 is declared user=bluetooth while every
+ * process on it runs in mtk_hal_bluetooth, and uid 1000 alone hosts 63
+ * different domains.  What a process can actually wear is the set of
+ * labels observed for that uid, so -Z is checked against that set: a
+ * context outside it is refused the way real su refuses a bad context
+ * (message on stderr, non-zero exit) instead of being silently taken.
+ *
+ * Source is "ps -A -o LABEL,UID" -- the default USER column is a name,
+ * not a uid, so the name would have to be resolved backwards.  Harvested
+ * once per process; a uid with no live process has no set, and then the
+ * domain-exists check alone decides, as before.
+ */
+static bool valid_uint_str(const char *s, long *out);
+static int run_capture_argv_list(char **argv, char **out, size_t *outlen);
+
+#define UID_DOM_MAX 8192
+typedef struct { long uid; char dom[64]; int n; } uid_dom_t;
+static uid_dom_t g_uid_doms[UID_DOM_MAX];
+static int g_uid_doms_n;
+static bool g_uid_doms_done;
+
+static void selinux_ctx_domain(const char *ctx, char *out, size_t cap)
+{
+	const char *p = ctx;
+	int colons = 0;
+	while (*p != '\0' && colons < 2) {
+		if (*p == ':') {
+			colons++;
+			if (colons == 2) { p++; break; }
+		}
+		p++;
+	}
+	snprintf(out, cap, "%s", p);
+	char *c = strchr(out, ':');
+	if (c != NULL)
+		*c = '\0';
+}
+
+static void uid_doms_load(void)
+{
+	if (g_uid_doms_done)
+		return;
+	g_uid_doms_done = true;
+	char *av[] = { (char *)"/system/bin/ps", (char *)"-A", (char *)"-o",
+		(char *)"LABEL,UID", NULL };
+	char *out = NULL;
+	size_t outlen = 0;
+	if (run_capture_argv_list(av, &out, &outlen) != 0 || out == NULL)
+		return;
+	char *copy = strdup(out);
+	free(out);
+	if (copy == NULL)
+		return;
+	char *save = NULL;
+	for (char *line = strtok_r(copy, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
+		if (strncmp(line, "u:r:", 4) != 0)
+			continue;
+		char *ps = NULL;
+		char *lab = strtok_r(line, " \t", &ps);
+		char *uidstr = strtok_r(NULL, " \t", &ps);
+		long uid;
+		if (lab == NULL || uidstr == NULL || !valid_uint_str(uidstr, &uid))
+			continue;
+		char dom[64];
+		selinux_ctx_domain(lab, dom, sizeof(dom));
+		if (dom[0] == '\0')
+			continue;
+		int i;
+		for (i = 0; i < g_uid_doms_n; i++)
+			if (g_uid_doms[i].uid == uid && strcmp(g_uid_doms[i].dom, dom) == 0) {
+				g_uid_doms[i].n++;
+				break;
+			}
+		if (i < g_uid_doms_n || g_uid_doms_n >= UID_DOM_MAX)
+			continue;
+		g_uid_doms[g_uid_doms_n].uid = uid;
+		snprintf(g_uid_doms[g_uid_doms_n].dom, sizeof(g_uid_doms[g_uid_doms_n].dom),
+			"%s", dom);
+		g_uid_doms[g_uid_doms_n].n = 1;
+		g_uid_doms_n++;
+	}
+	free(copy);
+}
+
+/* The per-uid check cannot live in selinux_ctx_norm_validate(): -Z is
+ * validated while parsing, and g_uid is still -1 then (it is only fixed
+ * up once the whole command line has been read), so the gate would never
+ * see a uid and would let everything through.  It runs after the uid is
+ * final, next to where the default context is chosen. */
+static void selinux_ctx_gate_uid(const char *ctx)
+{
+	if (g_uid < 0 || ctx == NULL || ctx[0] == '\0')
+		return;
+	uid_doms_load();
+	char dom[64];
+	selinux_ctx_domain(ctx, dom, sizeof(dom));
+	bool have_uid = false, ok = false;
+	for (int i = 0; i < g_uid_doms_n; i++)
+		if (g_uid_doms[i].uid == g_uid) {
+			have_uid = true;
+			if (strcmp(g_uid_doms[i].dom, dom) == 0) {
+				ok = true;
+				break;
+			}
+		}
+	if (!have_uid || ok)
+		return;
+	fprintf(stderr, "su: uid %ld does not run in `%s'; refusing\n", g_uid, dom);
+	fprintf(stderr, "su: uid %ld runs in", g_uid);
+	for (int i = 0; i < g_uid_doms_n; i++)
+		if (g_uid_doms[i].uid == g_uid)
+			fprintf(stderr, " %s", g_uid_doms[i].dom);
+	fprintf(stderr, "\n");
+	exit(1);
+}
+
 static const char *selinux_ctx_norm_validate(const char *in)
 {
 	static char norm[128];
@@ -583,7 +712,16 @@ static const char *selinux_ctx_norm_validate(const char *in)
 	return norm;
 }
 static bool valid_uint_str(const char *s, long *out);
+/* When the Shizuku bridge is not up, every harvest attempt blocks until
+ * the binder times out.  Two harvests then made a plain "su 0 -c id -Z"
+ * miss its own deadline, and the command failed outright even though the
+ * compiled-in baseline made the answer available without any harvest at
+ * all.  One failed attempt disables the rest for this process. */
+static int rishq_broken = 0;
+
 static int rishq_query(const char *cmd, char **out, size_t *outlen);
+static int facts_query(const char *mode, const char *arg, char **out, size_t *outlen);
+static int run_capture_argv_list(char **argv, char **out, size_t *outlen);
 static const char *aid_merged_table(void);
 static const char *const g_usermap_name = ".usermap";
 /* Look up "name:uid" lines in a merged table; return true when row found. */
@@ -652,8 +790,11 @@ static const char *aid_merged_table(void)
 			}
 			free(copy);
 		}
-		aid_append_oem_range(merged, sizeof(merged), &n, 2900, 2999);
-		aid_append_oem_range(merged, sizeof(merged), &n, 5000, 5999);
+		/* Process.FIRST_OEM_APP_UID..LAST_OEM_APP_UID.  The previous
+	 * 2900-2999 / 5000-5999 were not the OEM range at all: 5000-5999 sits
+	 * inside the named AID block, so auto-naming it oem_# shadowed real
+	 * AID names, and the actual OEM range got no name and no domain. */
+		aid_append_oem_range(merged, sizeof(merged), &n, 29000, 29999);
 		/* Merge the device's real users (uid unknown to the static
 		 * table): e.g. vendor-only AIDs running on this box. */
 		char path[PATH_MAX];
@@ -820,8 +961,624 @@ static const char *aid_name_for_uid(long uid, char *name, size_t namesz)
 	return res;
 }
 static int run_cmd_capture_argv(const char *path, const char *arg1, const char *arg2, char **out, size_t *outlen);
+/* L0 tables are device facts.  They change only when the user installs or
+ * removes a package, so a long TTL is right: a short one would re-run the
+ * 15s rishq cold start often enough to be felt, and would make the
+ * harvested answer depend on when it was taken. */
+#define SEAPP_MAX_AGE 86400
+#define APPTAB_MAX_AGE 21600
+
+/* ---------------- L0: device-harvested app / SELinux tables ----------------
+ *
+ * These are device facts, not session facts, so they are harvested once
+ * through rishq and then replayed verbatim.  Recomputing them per session
+ * is what makes a sandbox give itself away: two runs of the same command
+ * must produce byte-identical answers, and anything derived from a live
+ * /proc (pids, random tokens, timestamps) does not.
+ *
+ * The domain name an app runs in is decided by the device's own policy
+ * file, /system/etc/selinux/plat_seapp_contexts, which the app domain
+ * cannot read but rishq can.  It is keyed on minTargetSdkVersion, not on
+ * an arbitrary per-device index, which is why untrusted_app_27 must never
+ * be hardcoded: on another device, or for an app with a different target
+ * SDK, the same suffix maps differently or not at all.
+ */
+#define SEAPP_FILE ".seapp"
+#define APPTAB_FILE ".apptab"
+
+/* "minSdk=<n> domain=<name>" per applicable user=_app rule. */
+struct seapp_rule {
+	long min_sdk;
+	char domain[64];
+};
+
+static const char *seapp_path(void)
+{
+	static char p[PATH_MAX];
+	snprintf(p, sizeof(p), "%s/%s", g_work_dir, SEAPP_FILE);
+	return p;
+}
+
+static const char *apptab_path(void)
+{
+	static char p[PATH_MAX];
+	snprintf(p, sizeof(p), "%s/%s", g_work_dir, APPTAB_FILE);
+	return p;
+}
+
+static bool l0_fresh(const char *path, unsigned max_age);
+
+/* An app's MCS categories are fully determined by its app id, so they are
+ * computed rather than harvested:
+ *
+ *     n    = appid - 10000
+ *     cat1 = n % 256
+ *     cat2 = 256 + n / 256
+ *
+ * This is Android's own encoding -- the 16-bit app offset split into a low
+ * and a high byte, with the high byte lifted by 256 to clear the reserved
+ * low categories -- and it was verified against 60 live contexts on this
+ * device (uid 10282 -> c26,c257; 10368 -> c112,c257; 10380 -> c124,c257;
+ * 10241 -> c241,c256; 10162 -> c162,c256; 10276 -> c20,c257) plus 41
+ * platform/priv contexts that carry the fixed c512,c768 instead.
+ *
+ * Reading them off a running process with `ps -A -Z` also works, but it
+ * costs a 700-line harvest, a persistent .appctx file, and a lookup that
+ * silently fails for any app not currently running.  Computing it removes
+ * all three. */
+static void mcs_for_app_id(long app_id, char *out, size_t cap)
+{
+	long n = app_id - 10000;
+	if (n < 0)
+		n = 0;
+	snprintf(out, cap, ":c%ld,c%ld,c512,c768", n % 256, 256 + n / 256);
+}
+
+
+static bool l0_fresh(const char *path, unsigned max_age)
+{
+	struct stat st;
+	if (stat(path, &st) != 0)
+		return false;
+	return (time(NULL) - st.st_mtime) < (time_t)max_age;
+}
+
+/* Pull plat_seapp_contexts and keep only the user=_app rules that name a
+ * domain, as "<minSdk> <domain>" lines. */
+/* Store the device's own app rules verbatim.  Earlier this file was reduced
+ * to just "minTargetSdkVersion domain" pairs, which made the domain of a
+ * system app impossible to decide: those rules are selected by seinfo,
+ * isPrivApp and name, none of which survived.  The whole file is 24 lines,
+ * so keeping it intact costs nothing and keeps the resolution faithful. */
+static void harvest_seapp_rules(void)
+{
+	if (l0_fresh(seapp_path(), SEAPP_MAX_AGE))
+		return;
+	char *out = NULL;
+	size_t outlen = 0;
+	if (rishq_query("cat /system/etc/selinux/plat_seapp_contexts 2>/dev/null",
+			&out, &outlen) != 0 || out == NULL) {
+		free(out);
+		return;
+	}
+	FILE *f = fopen(seapp_path(), "w");
+	if (f == NULL) {
+		free(out);
+		return;
+	}
+	char *save = NULL;
+	for (char *line = strtok_r(out, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
+		if (strstr(line, "user=_app") == NULL)
+			continue;
+		if (strstr(line, "isSystemServer=true") != NULL)
+			continue;
+		if (strstr(line, " domain=") == NULL)
+			continue;
+		fprintf(f, "%s\n", line);
+	}
+	fclose(f);
+	free(out);
+}
+/* uid -> package name index, from pm list packages -U.
+ *
+ * This deliberately does not scrape "dumpsys package packages".  That
+ * output is 34k lines on this device, and parsing it for one package's
+ * targetSdk meant decoding a format that repeats the same package header
+ * in its Dexopt and Queries sub-sections -- which is how com.termux came
+ * out recorded as targetSdk 29 and a system app, and bin.mt.plus as 31
+ * instead of 28.  The index is 400 lines of a fixed "package:NAME uid:N"
+ * shape, and the per-package facts are fetched one package at a time and
+ * cached here, so a lookup costs one small query the first time and none
+ * afterwards. */
+static void harvest_app_table(void)
+{
+	if (l0_fresh(apptab_path(), APPTAB_MAX_AGE))
+		return;
+	char *out = NULL;
+	size_t outlen = 0;
+	/* One call, one whole table.  The dex asks PackageManager for every
+	 * installed package at once instead of scraping "pm list packages -U"
+	 * and then paying a "dumpsys package <name>" round trip per entry --
+	 * that per-package walk is what used to mis-attribute targetSdk, and
+	 * it needed the Shizuku bridge alive for the whole harvest.  Running
+	 * as our own uid needs no permission and no bridge at all. */
+	if (facts_query("--user", "0", &out, &outlen) != 0 || out == NULL) {
+		free(out);
+		return;
+	}
+	FILE *f = fopen(apptab_path(), "w");
+	if (f == NULL) {
+		free(out);
+		return;
+	}
+	char *save = NULL;
+	for (char *line = strtok_r(out, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
+		/* FACT<TAB>uid<TAB>user<TAB>name<TAB>tsdk<TAB>sys<TAB>priv<TAB>path */
+		long uid, user, ts;
+		int isys, ipriv;
+		char name[160];
+		if (sscanf(line, "FACT\t%ld\t%ld\t%159[^\t]\t%ld\t%d\t%d",
+				&uid, &user, name, &ts, &isys, &ipriv) != 6)
+			continue;
+		if (uid < 0 || name[0] == '-')
+			continue;
+		/* isSystem comes from FLAG_SYSTEM, which is what the runtime's own
+		 * app-domain selection reads.  A path test cannot tell the 51
+		 * preinstalled packages on this device that live under /data/app
+		 * from genuine user apps. */
+		fprintf(f, "%ld %s %ld %s %s\n", uid, name, ts,
+			isys ? "system" : "user", ipriv ? "priv" : "unpriv");
+	}
+	fclose(f);
+	free(out);
+}
+
+/* Android picks the rule with the highest minTargetSdkVersion that the
+ * app still satisfies, exactly as the runtime does. */
+/* Standard AOSP app rules, compiled in.
+ *
+ * Every device fact we resolve a context from used to be scraped over
+ * Shizuku into a file, which made the whole facility depend on that bridge
+ * staying alive: with Shizuku down the rule table was empty and every app
+ * fell back to the catch-all domain.  This is the unmodified AOSP rule set
+ * for app contexts, so a device whose own plat_seapp_contexts cannot be
+ * read still gets the right answer for the overwhelming majority of apps.
+ * When the real file is available it wins, because it carries the vendor
+ * rules this cannot know about. */
+static const char aosp_seapp_baseline[] =
+	"user=_app seinfo=platform name=com.android.traceur domain=traceur_app type=app_data_file levelFrom=all\n"
+	"user=_app isPrivApp=true name=com.android.remoteprovisioner domain=remote_prov_app type=app_data_file levelFrom=all\n"
+	"user=_app seinfo=platform isPrivApp=true name=com.android.permissioncontroller domain=permissioncontroller_app type=privapp_data_file levelFrom=all\n"
+	"user=_app isPrivApp=true name=com.google.android.permissioncontroller domain=permissioncontroller_app type=privapp_data_file levelFrom=all\n"
+	"user=_app seinfo=media isPrivApp=true name=com.android.providers.media.module domain=mediaprovider_app type=privapp_data_file levelFrom=all\n"
+	"user=_app isPrivApp=true name=com.google.android.providers.media.module domain=mediaprovider_app type=privapp_data_file levelFrom=all\n"
+	"user=_app isPrivApp=true name=com.android.vzwomatrigger domain=vzwomatrigger_app type=privapp_data_file levelFrom=all\n"
+	"user=_app isPrivApp=true name=com.google.android.gms domain=gmscore_app type=privapp_data_file levelFrom=user\n"
+	"user=_app isPrivApp=true name=com.google.android.gms.* domain=gmscore_app type=privapp_data_file levelFrom=user\n"
+	"user=_app isPrivApp=true name=com.google.android.gms:* domain=gmscore_app type=privapp_data_file levelFrom=user\n"
+	"user=_app isPrivApp=true name=com.google.android.gsf domain=gmscore_app type=privapp_data_file levelFrom=user\n"
+	"user=_app seinfo=app_zygote domain=app_zygote levelFrom=user\n"
+	"user=_app seinfo=media domain=mediaprovider type=app_data_file levelFrom=user\n"
+	"user=_app seinfo=platform domain=platform_app type=app_data_file levelFrom=user\n"
+	"user=_app isEphemeralApp=true domain=ephemeral_app type=app_data_file levelFrom=all\n"
+	"user=_app isPrivApp=true domain=priv_app type=privapp_data_file levelFrom=user\n"
+	"user=_app minTargetSdkVersion=32 domain=untrusted_app type=app_data_file levelFrom=all\n"
+	"user=_app minTargetSdkVersion=30 domain=untrusted_app_30 type=app_data_file levelFrom=all\n"
+	"user=_app minTargetSdkVersion=29 domain=untrusted_app_29 type=app_data_file levelFrom=all\n"
+	"user=_app minTargetSdkVersion=28 domain=untrusted_app_27 type=app_data_file levelFrom=all\n"
+	"user=_app minTargetSdkVersion=26 domain=untrusted_app_27 type=app_data_file levelFrom=user\n"
+	"user=_app domain=untrusted_app_25 type=app_data_file levelFrom=user\n";
+
+/* The device's own rules when they can be read, the compiled-in AOSP set
+ * otherwise. */
+static char *seapp_rules_text(void)
+{
+	FILE *f = fopen(seapp_path(), "r");
+	if (f != NULL) {
+		long sz = -1;
+		if (fseek(f, 0, SEEK_END) == 0)
+			sz = ftell(f);
+		if (sz > 0 && sz < (1 << 20)) {
+			rewind(f);
+			char *buf = malloc((size_t)sz + 1);
+			if (buf != NULL) {
+				size_t got = fread(buf, 1, (size_t)sz, f);
+				fclose(f);
+				buf[got] = '\0';
+				if (strstr(buf, " domain=") != NULL)
+					return buf;
+				free(buf);
+				return strdup(aosp_seapp_baseline);
+			}
+		}
+		fclose(f);
+	}
+	return strdup(aosp_seapp_baseline);
+}
+
+/* seapp_contexts name selectors use "*" and, on older policies, ":" as
+ * wildcards, so a plain strcmp would miss com.google.android.gms.*. */
+static bool seapp_name_matches(const char *pattern, const char *name)
+{
+	if (strchr(pattern, '*') == NULL && strchr(pattern, ':') == NULL)
+		return strcmp(pattern, name) == 0;
+	const char *p = pattern, *n = name, *star = NULL, *retry = NULL;
+	while (*n != '\0') {
+		if (*p == '*' || *p == ':') {
+			star = p++;
+			retry = n;
+		} else if (*p == *n) {
+			p++;
+			n++;
+		} else if (star != NULL) {
+			p = star + 1;
+			n = ++retry;
+		} else {
+			return false;
+		}
+	}
+	while (*p == '*' || *p == ':')
+		p++;
+	return *p == '\0';
+}
+
+/* Which of the policy's seinfo buckets a package falls in.  seinfo is
+ * really the signing key, which dumpsys will not tell us, so this keys off
+ * what is observable: the media providers carry the media key, and the rest
+ * of the system image carries the platform key. */
+static void package_seinfo(const char *pkg, int is_system, int is_priv,
+		char *out, size_t cap)
+{
+	if (pkg != NULL && (strncmp(pkg, "com.android.providers.media", 26) == 0
+			|| strncmp(pkg, "com.google.android.providers.media", 35) == 0))
+		snprintf(out, cap, "media");
+	else
+		/* AOSP has no "system_app" app domain: plat_seapp_contexts gives
+		 * every app off /system the platform_app domain, which is the
+		 * label the device was observed to use for them.  is_system
+		 * therefore has to reach seinfo=platform, or a system app drops
+		 * through to the minTargetSdkVersion ladder and is reported as
+		 * untrusted_app_*.  is_priv is included for the same reason --
+		 * a privileged app is platform-signed by definition. */
+		snprintf(out, cap, "%s", (is_system || is_priv) ? "platform" : "");
+}
+
+/* Resolve one package's domain the way the platform does: walk the rules in
+ * file order and take the first that matches.  The order is load-bearing --
+ * the minTargetSdkVersion rules run from strictest to loosest, so first
+ * match is what keeps a targetSdk 28 app out of the catch-all
+ * untrusted_app_25 that sits below it.
+ *
+ * Returns the domain and reports whether the matched rule isolates per app
+ * (levelFrom=all), which is what decides computed versus fixed categories. */
+static const char *seapp_lookup(const char *pkg, long target_sdk, int is_priv,
+		int is_system, int *level_from_all)
+{
+	static char dom[64];
+	char seinfo[32];
+	dom[0] = '\0';
+	*level_from_all = 0;
+	package_seinfo(pkg, is_system, is_priv, seinfo, sizeof(seinfo));
+
+	char *text = seapp_rules_text();
+	if (text == NULL)
+		return NULL;
+	int best_score = -1;
+	char *save = NULL;
+	for (char *line = strtok_r(text, "\n", &save); line;
+			line = strtok_r(NULL, "\n", &save)) {
+		const char *d = strstr(line, " domain=");
+		if (d == NULL)
+			continue;
+		d += 8;
+		char cand[64];
+		int k = 0;
+		while (d[k] && !isspace((unsigned char)d[k]) && k < (int)sizeof(cand) - 1) {
+			cand[k] = d[k];
+			k++;
+		}
+		cand[k] = '\0';
+		if (k == 0)
+			continue;
+
+		const char *nm = strstr(line, " name=");
+		if (nm != NULL) {
+			char pat[128];
+			const char *s = nm + 6;
+			int j = 0;
+			while (*s && !isspace((unsigned char)*s) && j < (int)sizeof(pat) - 1)
+				pat[j++] = *s++;
+			pat[j] = '\0';
+			if (pkg == NULL || !seapp_name_matches(pat, pkg))
+				continue;
+		}
+		if (strstr(line, "isPrivApp=true") != NULL && !is_priv)
+			continue;
+		if (strstr(line, "isPrivApp=false") != NULL && is_priv)
+			continue;
+		if (strstr(line, "fromRunAs=true") != NULL)
+			continue;
+		if (strstr(line, "isEphemeralApp=true") != NULL)
+			continue;
+		const char *si = strstr(line, " seinfo=");
+		if (si != NULL) {
+			char want[32];
+			const char *s = si + 8;
+			int j = 0;
+			while (*s && !isspace((unsigned char)*s) && j < (int)sizeof(want) - 1)
+				want[j++] = *s++;
+			want[j] = '\0';
+			if (strcmp(want, seinfo) != 0)
+				continue;
+		}
+		const char *ts = strstr(line, " minTargetSdkVersion=");
+		if (ts != NULL && target_sdk < atol(ts + 21))
+			continue;
+
+		/* Prefer the most specific rule that matches.  Plain first-match
+		 * gets this wrong: com.android.providers.media.module matches
+		 * both "seinfo=media domain=mediaprovider" and the four-selector
+		 * rule naming it, and the device gives the latter.  Counting
+		 * selectors reproduces that, while leaving the minTargetSdkVersion
+		 * ladder to file order, which is what it relies on. */
+		int score = 0;
+		for (const char *k = line; (k = strstr(k, "=")) != NULL; k++)
+			if (k == line || isspace((unsigned char)k[-1]))
+				score++;
+		if (score <= best_score)
+			continue;
+		best_score = score;
+		snprintf(dom, sizeof(dom), "%s", cand);
+		*level_from_all = strstr(line, "levelFrom=all") != NULL;
+	}
+	free(text);
+	return dom[0] != '\0' ? dom : NULL;
+}
+
+/* Rewrite one index line with its detail filled in, so the next session
+ * resolves the same uid without another query. */
+static void apptab_cache_detail(long uid, const char *name, long tsdk,
+		int is_system, int is_priv)
+{
+	FILE *f = fopen(apptab_path(), "r");
+	if (f == NULL)
+		return;
+	/* The temporary must sit beside the target: a rename across
+	 * filesystems fails, and /data/local/tmp is not writable by an app
+	 * uid, so the first version silently cached nothing. */
+	char tmp[PATH_MAX];
+	snprintf(tmp, sizeof(tmp), "%s.tmp", apptab_path());
+	FILE *w = fopen(tmp, "w");
+	if (w == NULL) {
+		fclose(f);
+		return;
+	}
+	char line[320];
+	while (fgets(line, sizeof(line), f) != NULL) {
+		long u, ts;
+		char nm[160], sys_s[16], priv_s[16];
+		if (sscanf(line, "%ld %159s %ld %15s %15s", &u, nm, &ts,
+				sys_s, priv_s) == 5 && u == uid && ts <= 0) {
+			fprintf(w, "%ld %s %ld %s %s\n", uid, name, tsdk,
+				is_system ? "system" : "user",
+				is_priv ? "priv" : "plain");
+			continue;
+		}
+		fputs(line, w);
+	}
+	fclose(f);
+	fclose(w);
+	rename(tmp, apptab_path());
+}
+
+/* Fetch one package's targetSdk, system flag and privileged flag.  A
+ * single-package dump is a few hundred lines with exactly one package
+ * header, so there is nothing to disambiguate. */
+static void apptab_fetch_detail(const char *name, long uid, long *tsdk,
+		int *is_system, int *is_priv)
+{
+	char cmd[256];
+	snprintf(cmd, sizeof(cmd), "dumpsys package %s 2>/dev/null", name);
+	char *out = NULL;
+	size_t outlen = 0;
+	if (rishq_query(cmd, &out, &outlen) != 0 || out == NULL) {
+		free(out);
+		return;
+	}
+	*tsdk = 0;
+	*is_system = 0;
+	*is_priv = 0;
+	int have_path = 0;
+	char codepath[256] = { 0 };
+	char *save = NULL;
+	for (char *line = strtok_r(out, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
+		long u;
+		if (sscanf(line, " userId=%ld", &u) == 1)
+			have_path = u == uid ? have_path : -1;
+		if (sscanf(line, " codePath=%255s", codepath) == 1)
+			have_path = 1;
+		const char *ts = strstr(line, "targetSdk=");
+		if (ts != NULL)
+			*tsdk = atol(ts + 10);
+		if (strstr(line, "pkgFlags=[") != NULL && have_path == 0)
+			*is_system = strstr(line, " SYSTEM ") != NULL;
+	}
+	/* Everything under /data is installed by the user and everything
+	 * else lives in the read-only system image, so the path settles it
+	 * even when dumpsys omits the flags line.  Verified against the
+	 * device: no package in /data/app is a system app. */
+	*is_system = have_path > 0 && strncmp(codepath, "/data/", 6) != 0;
+	*is_priv = strstr(codepath, "priv-app") != NULL;
+	free(out);
+}
+
+static bool apptab_lookup(long uid, long *target_sdk, int *is_system,
+		char *package_name, size_t name_cap, int *is_priv_app)
+{
+	long app_id = uid % 100000;
+	/* Ask the dex directly.
+	 *
+	 * The cached table was never usable: this process runs as uid 2000
+	 * under rish, which cannot create files in the app's private
+	 * directory, so every harvest silently wrote nothing and the table
+	 * stayed absent.  The lookup that matters is for exactly one uid per
+	 * session, so there is nothing to amortise here -- a single binder
+	 * query replaces the file, the staleness check and the rewrite. */
+	{
+		char ubuf[16];
+		snprintf(ubuf, sizeof(ubuf), "%ld", uid);
+		char *out = NULL;
+		size_t outlen = 0;
+		if (facts_query("--uid", ubuf, &out, &outlen) == 0 && out != NULL) {
+			long u, user, ts;
+			int isys, ipriv;
+			char name[160];
+			if (sscanf(out, "FACT\t%ld\t%ld\t%159[^\t]\t%ld\t%d\t%d",
+					&u, &user, name, &ts, &isys, &ipriv) == 6
+			    && u % 100000 == app_id && name[0] != '-') {
+				snprintf(package_name, name_cap, "%s", name);
+				*target_sdk = ts;
+				*is_system = isys;
+				*is_priv_app = ipriv;
+				free(out);
+				return true;
+			}
+		}
+		free(out);
+	}
+	FILE *f = fopen(apptab_path(), "r");
+	if (f == NULL)
+		return false;
+	char line[320];
+	bool found = false;
+	long u, ts;
+	char name[160], sys_s[16], priv_s[16];
+	while (fgets(line, sizeof(line), f) != NULL) {
+		if (sscanf(line, "%ld %159s %ld %15s %15s", &u, name, &ts,
+				sys_s, priv_s) != 5)
+			continue;
+		if (u % 100000 != app_id)
+			continue;
+		snprintf(package_name, name_cap, "%s", name);
+		*is_priv_app = strcmp(priv_s, "priv") == 0;
+		*is_system = strcmp(sys_s, "system") == 0;
+		if (ts <= 0) {
+			apptab_fetch_detail(name, u, &ts, is_system, is_priv_app);
+			*target_sdk = ts;
+			fclose(f);
+			apptab_cache_detail(u, name, ts, *is_system, *is_priv_app);
+			return true;
+		}
+		*target_sdk = ts;
+		found = true;
+		break;
+	}
+	fclose(f);
+	return found;
+}
+
+
+/* Domains that isolate each app get the computed per-app pair; every
+ * shared-level domain observed on a real device (platform_app, priv_app,
+ * gmscore_app, mediaprovider) carries the same fixed c512,c768 instead. */
+static void mcs_categories_for_domain(const char *dom, long app_id,
+		char *out, size_t cap)
+{
+	if (dom != NULL && strncmp(dom, "untrusted_app", 13) == 0) {
+		long n = app_id - 10000;
+		if (n < 0)
+			n = 0;
+		snprintf(out, cap, ":c%ld,c%ld,c512,c768", n % 256, 256 + n / 256);
+		return;
+	}
+	snprintf(out, cap, ":c512,c768");
+}
+
+
+/* Full context for a non-root app uid: the domain comes from the device's
+ * own policy keyed on the app's real target SDK, the categories are
+ * computed from the app id.  Nothing here is harvested per app, so the
+ * answer is identical whether or not the app is currently running. */
+static const char *selinux_ctx_for_app_uid(long uid)
+{
+	static char ctx[192];
+	ctx[0] = '\0';
+	long app_id = uid % 100000;
+	/* Shared platform uids keep their own domains and are not app
+	 * contexts at all; the caller resolves those by name. */
+	if (app_id == 1000 || app_id == 1001 || app_id == 1002
+	    || (app_id >= 2000 && app_id <= 2999) || (app_id >= 3000 && app_id <= 3999)
+	    || (app_id >= 5000 && app_id <= 5999))
+		return NULL;
+	/* Isolated processes (Process.FIRST_ISOLATED_UID..LAST_ISOLATED_UID)
+	 * own no installed package, so the package table cannot describe them
+	 * and they came back with no context.  The policy has a domain for
+	 * them -- this device had six of them running in isolated_app -- and
+	 * it is levelFrom=user, so the categories are the fixed pair.
+	 *
+	 * The OEM app range (29000-29999) is deliberately NOT given oem_app
+	 * here: no oem_app process exists on this device and the loaded policy
+	 * cannot be read to confirm the domain is even defined, and inventing
+	 * a label the policy does not have leaves the session with no context
+	 * at all.  That range still needs its name mapping (fixed above), but
+	 * its context is a known open item. */
+	if (app_id >= 99000 && app_id <= 99999) {
+		snprintf(ctx, sizeof(ctx), "u:r:isolated_app:s0:c512,c768");
+		return ctx;
+	}
+	/* SDK sandbox uids (Process.FIRST_SDK_SANDBOX_UID..LAST_SDK_SANDBOX_UID)
+	 * are user=_sdksandbox in the policy, and that rule is levelFrom=all --
+	 * so unlike the shared-level domains above, the categories are the
+	 * per-app computation.  They sit below the app range and used to be
+	 * resolved as ordinary apps. */
+	if (app_id >= 20000 && app_id <= 28999) {
+		char mcs[128];
+		mcs_for_app_id(app_id, mcs, sizeof(mcs));
+		snprintf(ctx, sizeof(ctx), "u:r:sdk_sandbox:s0%s", mcs);
+		return ctx;
+	}
+	harvest_seapp_rules();
+	harvest_app_table();
+
+	long target_sdk = 0;
+	int is_system = 0, is_priv = 0, level_all = 0;
+	char pkbuf[128] = { 0 };
+	const char *dom = NULL;
+	if (apptab_lookup(uid, &target_sdk, &is_system, pkbuf, sizeof(pkbuf), &is_priv))
+		dom = seapp_lookup(pkbuf, target_sdk, is_priv, is_system, &level_all);
+	if (dom == NULL) {
+		/* No package owns this uid, or the harvest failed.  Use the
+		 * untrusted domain the device assigns to ordinary apps rather
+		 * than guessing a name of our own. */
+		int la = 0;
+		dom = seapp_lookup(NULL, 0, 0, 0, &la);
+		if (dom == NULL)
+			return NULL;
+		level_all = la;
+	}
+	char mcs[128];
+	if (level_all)
+		mcs_for_app_id(app_id, mcs, sizeof(mcs));
+	else
+		snprintf(mcs, sizeof(mcs), ":c512,c768");
+	snprintf(ctx, sizeof(ctx), "u:r:%s:s0%s", dom, mcs);
+	return ctx;
+}
+
 static const char *selinux_ctx_for_user(const char *user)
 {
+	/* A per-app uid must be resolved before the numeric form is turned
+	 * into an AID_USERS name: once the name exists, "10402" is
+	 * indistinguishable from any other account name, and the app's real
+	 * domain would never be looked up. */
+	if (user != NULL && isdigit((unsigned char)user[0])) {
+		long u;
+		if (valid_uint_str(user, &u) && u >= 10000) {
+			const char *appctx = selinux_ctx_for_app_uid(u);
+			if (appctx != NULL && appctx[0] != '\0')
+				return appctx;
+		}
+	}
 	/* resolve name like uid/gid resolution does: numeric -> AID_USERS name */
 	const char *name = user;
 	char namebuf[64];
@@ -846,7 +1603,7 @@ static const char *selinux_ctx_for_user(const char *user)
 		char *copy = strdup(out);
 		free(out);
 		if (copy != NULL) {
-			const char *pref = NULL, *first = NULL;
+			const char *pref = NULL;
 			char *lsave = NULL;
 			for (char *line = strtok_r(copy, "\n", &lsave); line; line = strtok_r(NULL, "\n", &lsave)) {
 				if (strncmp(line, "u:r:", 4) != 0)
@@ -862,16 +1619,12 @@ static const char *selinux_ctx_for_user(const char *user)
 					snprintf(g_ctx_buf, sizeof(g_ctx_buf), "%s", label);
 					break;
 				}
-				if (strncmp(label + 4, name, strlen(name)) == 0 && pref == NULL)
-					pref = label;
-				if (first == NULL)
-					first = label;
 			}
-			if (g_ctx_buf[0] == '\0') {
-				const char *chosen = pref != NULL ? pref : first;
-				if (chosen != NULL)
-					snprintf(g_ctx_buf, sizeof(g_ctx_buf), "%s", chosen);
-			}
+			/* Nothing else is acceptable here.  An earlier version fell
+			 * back to the first "u:r:" line of ps when no process
+			 * matched, which handed every unrecognised app the label of
+			 * an unrelated running process -- right often enough to
+			 * look like it was working.  Only an exact match counts. */
 			free(copy);
 			if (g_ctx_buf[0] != '\0')
 				return g_ctx_buf;
@@ -1027,6 +1780,66 @@ static int run_cmd_capture(const char *path, const char *arg, char **out, size_t
 {
 	return run_cmd_capture_argv(path, arg, NULL, out, outlen);
 }
+/* Same capture, but for a command with an arbitrary argument list.  The
+ * two-argument form above cannot express the app_process invocation the
+ * facts dex needs. */
+static int run_capture_argv_list(char **argv, char **out, size_t *outlen)
+{
+	int pipefd[2];
+	if (pipe(pipefd) != 0)
+		return -1;
+	pid_t pid = fork();
+	if (pid < 0) {
+		close(pipefd[0]);
+		close(pipefd[1]);
+		return -1;
+	}
+	if (pid == 0) {
+		dup2(pipefd[1], STDOUT_FILENO);
+		close(pipefd[0]);
+		close(pipefd[1]);
+		execv(argv[0], argv);
+		_exit(127);
+	}
+	close(pipefd[1]);
+	size_t cap = 8192, len = 0;
+	char *buf = malloc(cap);
+	if (!buf) {
+		close(pipefd[0]);
+		return -1;
+	}
+	for (;;) {
+		if (len + 4096 + 1 > cap) {
+			cap *= 2;
+			char *nb = realloc(buf, cap);
+			if (!nb) {
+				free(buf);
+				close(pipefd[0]);
+				return -1;
+			}
+			buf = nb;
+		}
+		ssize_t n = read(pipefd[0], buf + len, cap - len - 1);
+		if (n < 0) {
+			if (errno == EINTR)
+				continue;
+			break;
+		}
+		if (n == 0)
+			break;
+		len += (size_t)n;
+	}
+	buf[len] = '\0';
+	close(pipefd[0]);
+	int status = 0;
+	waitpid(pid, &status, 0);
+	*out = buf;
+	*outlen = len;
+	if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+		return -1;
+	return 0;
+}
+
 static int run_cmd_capture_argv(const char *path, const char *arg1, const char *arg2, char **out, size_t *outlen)
 {
 	int pipefd[2];
@@ -1086,18 +1899,89 @@ static int run_cmd_capture_argv(const char *path, const char *arg1, const char *
 		return -1;
 	return 0;
 }
+/* Load the facts dex in a plain app_process and read what it prints.
+ *
+ * The dex talks to the package service over binder as our own uid, so this
+ * needs no Shizuku, no shell privilege and no permission, and it cannot
+ * destabilise the host the way the scraped harvest did.  Only a hard failure
+ * trips the breaker; an empty table is a legitimate answer. */
+static int facts_broken = 0;
+static int facts_query(const char *mode, const char *arg, char **out, size_t *outlen)
+{
+	if (facts_broken)
+		return -1;
+	char dex[PATH_MAX];
+	/* Normally the dex sits next to this binary, which is where the
+	 * package installs it.  Some deployments run the binary out of a
+	 * directory that only permits overwriting existing files, so the
+	 * private work directory is tried as well. */
+	const char *dirs[2];
+	dirs[0] = g_self_dir;
+	dirs[1] = g_work_dir;
+	struct stat st;
+	dex[0] = '\0';
+	for (int i = 0; i < 2 && dex[0] == '\0'; i++) {
+		if (dirs[i] == NULL || dirs[i][0] == '\0')
+			continue;
+		char cand[PATH_MAX];
+		snprintf(cand, sizeof(cand), "%s/%s", dirs[i], FACTS_DEX_NAME);
+		if (stat(cand, &st) == 0) {
+			snprintf(dex, sizeof(dex), "%s", cand);
+			break;
+		}
+	}
+	if (dex[0] == '\0') {
+		facts_broken = 1;
+		return -1;
+	}
+	/* app_process refuses a writable dex on Android 14+, so match what
+	 * rish does with its own copy. */
+	chmod(dex, 0400);
+	char cpath[PATH_MAX + 32];
+	snprintf(cpath, sizeof(cpath), "-Djava.class.path=%s", dex);
+	char *av[9];
+	av[0] = (char *)APP_PROCESS;
+	av[1] = cpath;
+	av[2] = (char *)"/system/bin";
+	av[3] = (char *)"--nice-name=afsfacts";
+	av[4] = (char *)"afakesu.facts.Facts";
+	av[5] = (char *)mode;
+	av[6] = (char *)arg;
+	av[7] = NULL;
+	int rc = run_capture_argv_list(av, out, outlen);
+	if (rc < 0 || *out == NULL)
+		facts_broken = 1;
+	return rc;
+}
 static int rishq_query(const char *cmd, char **out, size_t *outlen)
 {
+	/* One failed attempt disables the rest for this process: with the
+	 * bridge down every call blocks until the binder times out, and two
+	 * harvests were enough to make a plain "su 0 -c id -Z" miss its own
+	 * deadline even though the compiled-in baseline had the answer. */
+	if (rishq_broken)
+		return -1;
 	char rishq_path[PATH_MAX];
 	snprintf(rishq_path, sizeof(rishq_path), "%s/%s", g_self_dir, RISHQ_NAME);
 	struct stat st;
-	if (stat(rishq_path, &st) != 0)
+	if (stat(rishq_path, &st) != 0) {
+		rishq_broken = 1;
 		return -1;
+	}
 	char bash_path[PATH_MAX];
 	snprintf(bash_path, sizeof(bash_path), "%s/bash", g_work_dir);
+	int rc;
 	if (stat(bash_path, &st) == 0)
-		return run_cmd_capture_argv(bash_path, rishq_path, cmd, out, outlen);
-	return run_cmd_capture(rishq_path, cmd, out, outlen);
+		rc = run_cmd_capture_argv(bash_path, rishq_path, cmd, out, outlen);
+	else
+		rc = run_cmd_capture(rishq_path, cmd, out, outlen);
+	/* Only a hard failure trips this.  Treating any non-zero status as
+	 * a broken bridge disabled harvesting for the rest of the process on
+	 * a command that had actually succeeded, which is how .seapp and
+	 * .apptab stopped being written at all. */
+	if (rc < 0 || *out == NULL)
+		rishq_broken = 1;
+	return rc;
 }
 static bool real_snapshot_valid(void)
 {
@@ -1798,13 +2682,28 @@ static void gen_fake_status(void)
 				? "CapEff:\t000001ffffffffff\n"
 				: "CapEff:\t0000000000000000\n";
 		else if (strncmp(line, "CapBnd:", 7) == 0)
-			repl = g_uid == 0 && !g_drop_cap
-				? "CapBnd:\t000001ffffffffff\n"
-				: "CapBnd:\t0000000000000000\n";
+			/* setuid() does not touch the bounding set; only
+			 * prctl(PR_CAPBSET_DROP) and capset() shrink it.  A real
+			 * su session is forked from a root parent, so every
+			 * persona in it inherits the full bounding set even
+			 * after dropping to a non-zero uid.  Reporting an empty
+			 * CapBnd for `su shell` would be the giveaway, since
+			 * CapPrm/CapEff are 0 there but CapBnd is not. */
+			repl = g_drop_cap
+				? "CapBnd:\t0000000000000000\n"
+				: "CapBnd:\t000001ffffffffff\n";
 		else if (strncmp(line, "CapAmb:", 7) == 0)
-			repl = g_uid == 0 && !g_drop_cap
-				? "CapAmb:\t000001ffffffffff\n"
-				: "CapAmb:\t0000000000000000\n";
+			repl = "CapAmb:\t0000000000000000\n";
+		/* PRoot runs its tracee with NoNewPrivs=1 and a seccomp filter
+		 * installed, while a real root shell inherited from a root
+		 * parent has neither.  Leaving the supervisor's values in place
+		 * is what gave the fake away. */
+		else if (strncmp(line, "NoNewPrivs:", 11) == 0)
+			repl = "NoNewPrivs:\t0\n";
+		else if (strncmp(line, "Seccomp:", 8) == 0)
+			repl = "Seccomp:\t0\n";
+		else if (strncmp(line, "Seccomp_filters:", 16) == 0)
+			repl = "Seccomp_filters:\t0\n";
 		const char *use = repl ? repl : line;
 		size_t l = strlen(use);
 		if (n + l < cap) {
@@ -2042,6 +2941,7 @@ static void cleanup_workdir(void)
 	if (g_work_dir[0] == '\0')
 		return;
 	static const char *keep[] = { ".usermap", ".ugroups", ".xattrs", ".policy",
+		SEAPP_FILE, APPTAB_FILE,
 				      ".props", ".propsmod", NULL };
 	DIR *d = opendir(g_work_dir);
 	if (!d)
@@ -2909,6 +3809,7 @@ int main(int argc, char **argv)
 	ensure_current_uid_in_files();
 	if (g_selinux_ctx == NULL)
 		g_selinux_ctx = selinux_ctx_for_user(user);
+	selinux_ctx_gate_uid(g_selinux_ctx);
 	{
 		char ug[PATH_MAX];
 		snprintf(ug, sizeof(ug), "%s/.uidgid", g_work_dir);

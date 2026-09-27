@@ -24,3 +24,5 @@ src/ctx_test.txt
 fakesu.bak
 .tmp/
 src/termhijack*
+dex/out/
+dex/facts.dex

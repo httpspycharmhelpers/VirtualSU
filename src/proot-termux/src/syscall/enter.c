@@ -21,6 +21,9 @@
  */
 
 #include <errno.h>       /* errno(3), E* */
+
+/* Supplied by su.c: the session's --drop-cap choice. */
+extern int g_drop_cap;
 #include <talloc.h>      /* talloc_*, */
 #include <sys/un.h>      /* struct sockaddr_un, */
 #include <linux/net.h>   /* SYS_*, */
@@ -513,22 +516,40 @@ static void afakesu_regen_status_for_pid(pid_t pid)
 		} else if (strncmp(line, "CapInh:", 7) == 0) {
 			repl = "CapInh:\t0000000000000000\n";
 		} else if (strncmp(line, "CapPrm:", 7) == 0) {
-			repl = uid == 0
+			repl = uid == 0 && !g_drop_cap
 				? "CapPrm:\t000001ffffffffff\n"
 				: "CapPrm:\t0000000000000000\n";
 		} else if (strncmp(line, "CapEff:", 7) == 0) {
-			repl = uid == 0
+			repl = uid == 0 && !g_drop_cap
 				? "CapEff:\t000001ffffffffff\n"
 				: "CapEff:\t0000000000000000\n";
 		} else if (strncmp(line, "CapBnd:", 7) == 0) {
-			repl = uid == 0
-				? "CapBnd:\t000001ffffffffff\n"
-				: "CapBnd:\t0000000000000000\n";
+			/* Inherited whole from the root su parent: setuid()
+			 * never narrows the bounding set, so a non-root persona
+			 * still shows it full while CapPrm/CapEff are 0. */
+			repl = g_drop_cap
+				? "CapBnd:\t0000000000000000\n"
+				: "CapBnd:\t000001ffffffffff\n";
 		} else if (strncmp(line, "CapAmb:", 7) == 0) {
-			repl = uid == 0
-				? "CapAmb:\t0000000000000000\n"
-				: "CapAmb:\t0000000000000000\n";
-		}
+			/* Ambient caps are only ever non-zero when a process
+			 * explicitly raises them with prctl, which neither
+			 * Magisk's su nor a stock root shell does.  A real root
+			 * su session reports 0 here, so both branches are 0 and
+			 * the uid test was pointless. */
+			repl = "CapAmb:\t0000000000000000\n";
+		} else if (strncmp(line, "NoNewPrivs:", 11) == 0) {
+			/* PRoot runs the tracee with NNP set, because it has to
+			 * stop a setuid binary from really elevating.  A root
+			 * shell inherited from a root parent is not, and the
+			 * discrepancy is visible to anything reading
+			 * /proc/self/status. */
+			repl = "NoNewPrivs:\t0\n";
+		} else if (strncmp(line, "Seccomp:", 8) == 0) {
+			/* Likewise PRoot installs a seccomp filter; a real root
+			 * session has none. */
+			repl = "Seccomp:\t0\n";
+		} else if (strncmp(line, "Seccomp_filters:", 16) == 0)
+			repl = "Seccomp_filters:\t0\n";
 		const char *use = repl ? repl : line;
 		size_t l = strlen(use);
 		if (n + l < cap) {

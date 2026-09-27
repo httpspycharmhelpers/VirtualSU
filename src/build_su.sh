@@ -46,6 +46,15 @@ echo "== su.o =="
 $CC -c $COMMON -I"$PT" -I"$PT/src" \
     "$ROOT/su.c" -o "$BLD/su.o" || exit 1
 
+# The linker below globs every prebuilt .o under proot-termux/src, so an edit
+# to a proot source file is silently ignored unless it is recompiled here.
+# enter.c rewrites /proc/<pid>/status on every read, which is where the
+# faked Uid/Cap*/State/TracerPid actually come from, so it has to be built
+# from source rather than reused from the tree.
+echo "== enter.o =="
+$CC -c $PT_CFLAGS -DPROOT_EMBEDDED \
+    "$PT/src/syscall/enter.c" -o "$PT/src/syscall/enter.o" || exit 1
+
 echo "== link =="
 OBJS=""
 while IFS= read -r f; do

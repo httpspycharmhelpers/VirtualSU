@@ -10,7 +10,7 @@ set -u
 D="$(cd "$(dirname "$0")" && pwd)"
 CMD="$1"
 WD="${2:-30}"
-MARK="__AFS_${BASHPID}_$$__"
+MARK="__AFS_$$__"
 
 # 看门狗: 后台 sleep, 超时则杀会话使 read 得 EOF
 wp=""
