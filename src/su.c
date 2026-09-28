@@ -779,6 +779,17 @@ static void aid_append_oem_range(char *merged, size_t cap, size_t *n, int lo, in
  * resolves names against, so every user the vendor actually exposes
  * (incl. the 3000-series) has a uid<->name mapping instead of silently
  * collapsing into root. */
+/* Where a group set came from, recorded in the cache so a reading can be
+ * interpreted without guessing.  A cached answer and a live one are
+ * otherwise byte-identical, which is how a run served entirely from cache
+ * got reported as a fixed flaky harvest. */
+#define GRP_SRC_NONE     0
+#define GRP_SRC_LIVE     1	/* the bridge ran the command itself */
+#define GRP_SRC_READPROC 2	/* read off a real process via /proc */
+#define GRP_SRC_PM       3	/* PackageManager grant list */
+#define GRP_SRC_CACHE    4	/* replayed from the shared cache */
+static int g_groups_src = GRP_SRC_NONE;
+
 static int rishq_query(const char *cmd, char **out, size_t *outlen);
 static int facts_query(const char *mode, const char *arg, char **out, size_t *outlen);
 static int run_capture_argv_list(char **argv, char **out, size_t *outlen);
@@ -4108,8 +4119,23 @@ int main(int argc, char **argv)
 			long cu = strtol(cline, &cend, 10);
 			if (cend != colon || cu != g_uid)
 				continue;
+				/* "<uid>:<src> <gids...>".  Lines written before this
+				 * field existed carry no source and stay unknown rather
+				 * than being guessed at. */
+				int src = GRP_SRC_NONE;
+				char *after = colon + 1;
+				while (*after == ' ' || *after == '\t')
+					after++;
+				if (*after >= '0' && *after <= '9') {
+					char *e2;
+					long sv = strtol(after, &e2, 10);
+					if (e2 == after) {
+						src = (int)sv;
+						after = e2;
+					}
+				}
 			char *csave = NULL;
-			for (char *tok = strtok_r(colon + 1, " \t\r\n", &csave);
+			for (char *tok = strtok_r(after, " \t\r\n", &csave);
 			     tok != NULL && g_suppg_cnt < SUPP_GID_MAX;
 			     tok = strtok_r(NULL, " \t\r\n", &csave)) {
 				long gv;
@@ -4119,6 +4145,8 @@ int main(int argc, char **argv)
 				if (gv == g_gid)
 					continue;
 				g_suppg[g_suppg_cnt++] = strdup(tok);
+				if (g_suppg_cnt > 0)
+					g_groups_src = GRP_SRC_CACHE;
 			}
 			break;
 		}
@@ -4166,21 +4194,26 @@ int main(int argc, char **argv)
 			if (rishq_query("id -G", &idout, &idlen) == 0
 			    && idout != NULL) {
 				char *save = NULL;
-				int first = 1;
 				for (char *tok = strtok_r(idout, " \t\r\n", &save);
 				     tok != NULL && g_suppg_cnt < SUPP_GID_MAX;
 				     tok = strtok_r(NULL, " \t\r\n", &save)) {
 					long gv;
 					if (!valid_uint_str(tok, &gv))
 						continue;
-					/* `id -G` leads with the primary gid,
-					 * which g_gid already carries. */
-					if (first++ == 0 || gv == g_gid)
+					/* Drop the primary by value, not by
+					 * position.  Skipping the first token
+					 * assumed `id -G` always leads with it;
+					 * it does not, so on a reordered run a real
+					 * group (1004/input) was dropped and the
+					 * count came out one short.  Comparing
+					 * against g_gid already handles it. */
+					if (gv == g_gid)
 						continue;
 					g_suppg[g_suppg_cnt++] = strdup(tok);
 				}
 			}
 			exact = 1;
+			g_groups_src = GRP_SRC_LIVE;
 		}
 	}
 	if (g_suppg_cnt == 0 && !exact) {
@@ -4192,6 +4225,7 @@ int main(int argc, char **argv)
 		    "sub(/^Groups:[\\t ]*/,\"\",g); print u\"|\"g}' \"$f\" "
 		    "2>/dev/null; done";
 		if (rishq_query(cmd, &scan, &scanlen) == 0 && scan != NULL) {
+			g_groups_src = GRP_SRC_READPROC;
 			char *save = NULL;
 			for (char *ln = strtok_r(scan, "\n", &save);
 			     ln != NULL && g_suppg_cnt < SUPP_GID_MAX;
@@ -4230,6 +4264,7 @@ int main(int argc, char **argv)
 			char *out = NULL;
 			size_t outlen = 0;
 			if (rishq_query(cmd, &out, &outlen) == 0 && out != NULL) {
+				g_groups_src = GRP_SRC_PM;
 				/* gids=[...] only appears under this package's own User
 				 * block, and a single-package dump has exactly one such
 				 * header, so there is nothing to disambiguate.  The first
@@ -4299,7 +4334,7 @@ int main(int argc, char **argv)
 			FILE *gf = fopen(gt, "w");
 			if (gf == NULL)
 				continue;
-			fprintf(gf, "%ld:", g_uid);
+			fprintf(gf, "%ld:%d", g_uid, g_groups_src);
 			if (g_suppg_cnt > 0)
 				fprintf(gf, " %s", g_suppg[0]);
 			for (size_t k = 1; k < g_suppg_cnt; k++)
