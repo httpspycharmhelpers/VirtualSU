@@ -498,7 +498,18 @@ static void afakesu_regen_status_for_pid(pid_t pid)
 
 	const char *ctx = afakesu_read_session_ctx();
 	if (ctx == NULL)
-		ctx = uid == 0 ? "u:r:su:s0" : "u:r:shell:s0";
+		/* Same fallback mapping as su.c:selinux_ctx_for_user(), root
+		 * sessions wear ksu (what ksud actually hardcodes), and the other
+		 * static uids keep their real domain.  The old "su:s0" here was
+		 * left over from when the root domain was wrong. */
+		ctx = uid == 0 ? "u:r:ksu:s0" : (uid == 2000 ? "u:r:shell:s0"
+			: (uid == 1000 ? "u:r:system_app:s0"
+			: (uid >= 99000 && uid <= 99999 ? "u:r:isolated_app:s0" : NULL)));
+		if (ctx == NULL) {
+			char fb[64];
+			snprintf(fb, sizeof(fb), "u:r:untrusted_app_%d:s0", (uid >= 10000 && uid <= 19999) ? (int)(uid - 10000) : 0);
+			ctx = fb;
+		}
 
 	char *buf = malloc(32768);
 	if (buf == NULL) {
