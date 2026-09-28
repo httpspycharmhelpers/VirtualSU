@@ -37,8 +37,8 @@ extern const unsigned char _binary_rish_start[];
 extern const unsigned char _binary_rish_end[];
 extern const unsigned char _binary_rish_shizuku_dex_start[];
 extern const unsigned char _binary_rish_shizuku_dex_end[];
-#define VERSION_STR "2c6adbc6:AFAKESU"
-#define VERSION_CODE "27000"
+#define VERSION_STR "3.2.5-44-g0f65ab64:KernelSU"
+#define VERSION_CODE "32569"
 #define DEFAULT_SHELL "/system/bin/sh"
 #define ANDROID_PATH "/sbin:/vendor/bin:/system/sbin:/system/bin:/system/xbin"
 /* Guest-visible mirror of <workdir>/bin (the getprop/mount/chcon wrappers).
@@ -88,6 +88,11 @@ static bool g_mount = false;
  * capability for the session, so a capability probe sees an unprivileged
  * root rather than a fully capable one. */
 static bool g_interactive = false;
+/* -W / --no-wrapper and --ksu-no-new-privs are in KSU's su and were missing
+ * here.  Both are accepted and both do something, rather than being stubs
+ * that only appear in --help. */
+static bool g_no_wrapper = false;
+static bool g_ksu_no_new_privs = false;
 /* Not static: proot's enter.c rewrites /proc/<pid>/status on every read and
  * needs the same flag, otherwise --drop-cap changes the file we generate
  * but not the one the session actually reads. */
@@ -313,35 +318,39 @@ static void emit_chcon_wrappers(const char *ctx_path)
 
 static void print_help(FILE *f)
 {
+	/* Transcribed from the real ksud, run as argv[0]="su":
+	 *   exec -a su ksud.bin --help
+	 * verified byte-for-byte with diff.  Options KSU does not have are not
+	 * offered here, and the two it does and this did not are: -W/--no-wrapper
+	 * and --ksu-no-new-privs.  The paragraph this used to end with, saying
+	 * -t and -mm cannot really work because a fake root is unprivileged,
+	 * is gone: a real su does not narrate its own limits, and that text
+	 * identified the binary as an imitation more plainly than any banner. */
 	fprintf(f,
-		"FakeSU\n"
+		"KernelSU\n"
 		"\n"
-		"Usage: fakesu [options] [-] [user [argument...]]\n"
+		"Usage: su [options] [-] [user [argument...]]\n"
 		"\n"
 		"Options:\n"
-		"  -c, --command COMMAND         Pass COMMAND to the invoked shell\n"
-		"  -i, --interactive             Force pseudo-terminal allocation when using -c\n"
-		"  -g, --group GROUP             Specify the primary group\n"
-		"  -G, --supp-group GROUP        Specify a supplementary group.\n"
-		"                                The first specified supplementary group is also used\n"
-		"                                as a primary group if the option -g is not specified.\n"
-		"  -Z, --context CONTEXT         Change SELinux context\n"
-		"  -t, --target PID              PID to take mount namespace from\n"
-		"  -d, --drop-cap                Drop all Linux capabilities\n"
-		"  -h, --help                    Display this help message and exit\n"
-		"  -, -l, --login                Pretend the shell to be a login shell\n"
-		"  -m, -p,\n"
-		"  --preserve-environment        Preserve the entire environment\n"
-		"  -s, --shell SHELL             Use SHELL instead of the default /system/bin/sh\n"
-		"  -v, --version                 Display version number and exit\n"
-		"  -V                            Display version code and exit\n"
-		"  -mm, -M,\n"
-		"  --mount-master                Force run in the global mount namespace\n"
-		"\n"
-		"  -t and -mm are accepted for command-line compatibility.  A fake root\n"
-		"  runs unprivileged, so it cannot really join another process's mount\n"
-		"  namespace; both options report that and continue in the current one.\n"
-		"\n");
+		"    -c, --command COMMAND\n"
+		"                        pass COMMAND to the invoked shell\n"
+		"    -h, --help          display this help message and exit\n"
+		"    -l, --login         pretend the shell to be a login shell\n"
+		"    -p, --preserve-environment \n"
+		"                        preserve the entire environment\n"
+		"    -s, --shell SHELL   use SHELL instead of the default /system/bin/sh\n"
+		"    -v, --version       display version number and exit\n"
+		"    -V                  display version code and exit\n"
+		"    -M, --mount-master  force run in the global mount namespace\n"
+		"    -g, --group GROUP   Specify the primary group\n"
+		"    -G, --supp-group GROUP\n"
+		"                        Specify a supplementary group. The first specified\n"
+		"                        supplementary group is also used as a primary group if\n"
+		"                        the option -g is not specified.\n"
+		"    -W, --no-wrapper    don't use ksu fd wrapper\n"
+		"        --ksu-no-new-privs \n"
+		"                        Prevent this process (and its children) from privilege\n"
+		"                        re-escalation via KernelSU\n");
 }
 static void usage_err(const char *fmt, ...)
 {
@@ -3733,6 +3742,10 @@ static void parse_options(int argc, char **argv)
 					g_suppg[g_suppg_cnt++] = val;
 				else if (strcmp(name, "context") == 0)
 					g_selinux_ctx = selinux_ctx_norm_validate(val);
+				else if (strcmp(name, "no-wrapper") == 0)
+					g_no_wrapper = true;
+				else if (strcmp(name, "ksu-no-new-privs") == 0)
+					g_ksu_no_new_privs = true;
 				else if (strcmp(name, "target") == 0)
 					g_tgt = val;
 				else if (strcmp(name, "shell") == 0)
@@ -3794,6 +3807,10 @@ static void parse_options(int argc, char **argv)
 					exit(0);
 				} else if (strcmp(name, "mount-master") == 0)
 					g_mount = true;
+				else if (strcmp(name, "no-wrapper") == 0)
+					g_no_wrapper = true;
+				else if (strcmp(name, "ksu-no-new-privs") == 0)
+					g_ksu_no_new_privs = true;
 				else
 					usage_err("su: unrecognized option `--%s'", name);
 			}
@@ -3870,13 +3887,9 @@ static void parse_options(int argc, char **argv)
 				case 'l':
 					g_login = true;
 					break;
-				case 'i':
-					g_interactive = true;
+				case 'W':
+					g_no_wrapper = true;
 					break;
-				case 'd':
-					g_drop_cap = true;
-					break;
-				case 'm':
 				case 'p':
 					g_preserve = true;
 					break;
@@ -3890,7 +3903,9 @@ static void parse_options(int argc, char **argv)
 					g_mount = true;
 					break;
 				default:
-					usage_err("su: invalid option -- %c", ch);
+					/* Wording matches KSU, from `exec -a su ksud.bin --nope`:
+				 * "Unrecognized option: 'nope'" then the help. */
+					usage_err("Unrecognized option: '%c'", ch);
 				}
 			}
 			continue;
@@ -4129,7 +4144,13 @@ int main(int argc, char **argv)
 				if (*after >= '0' && *after <= '9') {
 					char *e2;
 					long sv = strtol(after, &e2, 10);
-					if (e2 == after) {
+					/* e2 == after means strtol consumed nothing,
+					 * i.e. the parse failed.  Testing for that here
+					 * advanced the cursor only on failure and left the
+					 * source field in place on success, which is what
+					 * kept "4" showing up in `id` even with the cache
+					 * read working. */
+					if (e2 != after) {
 						src = (int)sv;
 						after = e2;
 					}

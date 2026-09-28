@@ -84,6 +84,14 @@ echo "== enter.o =="
 $CC -c $PT_CFLAGS -DPROOT_EMBEDDED \
     "$PT/src/syscall/enter.c" -o "$PT/src/syscall/enter.o" || exit 1
 
+# fake_id0.c is a third reader of .ugroups (afk_ugroups_for), and the linker
+# below globs prebuilt .o, so editing it here did nothing on its own.  That
+# is how the provenance field kept showing up as a group id after the other
+# two readers had been fixed: this object was simply never rebuilt.
+echo "== fake_id0.o =="
+$CC -c $PT_CFLAGS -DPROOT_EMBEDDED \
+    "$PT/src/extension/fake_id0/fake_id0.c" -o "$PT/src/extension/fake_id0/fake_id0.o" || exit 1
+
 echo "== link =="
 OBJS=""
 while IFS= read -r f; do

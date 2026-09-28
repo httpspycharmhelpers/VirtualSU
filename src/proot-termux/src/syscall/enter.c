@@ -463,9 +463,23 @@ static void afakesu_regen_status_for_pid(pid_t pid)
 				u = strtol(line, &end, 10);
 				if (end != colon || u != uid)
 					continue;
+				/* Same "<uid>:<src> <gids...>" line su.c writes.  This
+				 * parser did not learn about the provenance field, so the
+				 * source number was being read as a group id and showed
+				 * up in `id` as e.g. "groups=...,4,...".  There are two
+				 * readers of this file and the format changed in both. */
+				char *after = colon + 1;
+				while (*after == ' ' || *after == '\t')
+					after++;
+				if (*after >= '0' && *after <= '9') {
+					char *e2;
+					long sv = strtol(after, &e2, 10);
+					if (e2 == after)
+						after = e2;
+				}
 				char *save = NULL;
 				size_t glen = 0;
-				for (char *tok = strtok_r(colon + 1, " \t\r\n", &save);
+				for (char *tok = strtok_r(after, " \t\r\n", &save);
 				     tok != NULL;
 				     tok = strtok_r(NULL, " \t\r\n", &save)) {
 					long gv;

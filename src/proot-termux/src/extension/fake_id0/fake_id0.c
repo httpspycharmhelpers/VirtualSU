@@ -74,7 +74,22 @@ static const gid_t *afk_ugroups_for(long uid, size_t *count)
 			continue;
 		if (sscanf(line, "%ld", &u) != 1 || u != uid)
 			continue;
-		char *tok = strtok(colon + 1, " \t\r\n");
+		/* Same "<uid>:<src> <gids...>" line the other two readers see.
+		 * This is the third one, and it was still taking the provenance
+		 * field as a group id, which is how "groups=...,4,..." got into
+		 * `id` even after the other two parsers were fixed.  strtok is
+		 * used rather than strtok_r throughout this function, so the skip
+		 * below has to go through a strtok call to stay in step with it. */
+		char *after = colon + 1;
+		while (*after == ' ' || *after == '\t')
+			after++;
+		if (*after >= '0' && *after <= '9') {
+			char *e2;
+			long sv = strtol(after, &e2, 10);
+			if (e2 != after)
+				after = e2;
+		}
+		char *tok = strtok(after, " \t\r\n");
 		while (tok != NULL && n < sizeof(list) / sizeof(list[0])) {
 			long v;
 			char *end;
