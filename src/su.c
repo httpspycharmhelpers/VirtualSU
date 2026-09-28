@@ -526,7 +526,7 @@ static const char *const SELINUX_KNOWN_EXTRA_CTX[] = {
 	"u:r:zygote:s0", "u:r:surfaceflinger:s0", "u:r:servicemanager:s0",
 	"u:r:netd:s0", "u:r:vold:s0", "u:r:installd:s0", "u:r:adbd:s0",
 	"u:r:untrusted_app:s0", "u:r:platform_app:s0", "u:r:priv_app:s0",
-	"u:r:isolated_app:s0", "u:r:su:s0",
+	"u:r:isolated_app:s0", "u:r:su:s0", "u:r:ksu:s0",
 };
 static void selinux_ctx_reject(const char *in)
 {
@@ -1640,12 +1640,17 @@ static const char *selinux_ctx_for_user(const char *user)
 		if (valid_uint_str(name, &u) && aid_name_for_uid(u, namebuf, sizeof(namebuf)))
 			name = namebuf;
 	}
-	/* AOSP su -- and Magisk su, which is what this tool follows -- put the
-	 * root shell in the su domain.  kernel:s0 is what uid 0's *other*
-	 * processes (init and friends) wear, not what a su session wears, so
-	 * borrowing it here would be the tell. */
+	/* KernelSU is the reference here, and its root sessions run in
+	 * u:r:ksu:s0 -- that string is hardcoded in ksud itself.  Note this
+	 * is NOT the u:r:su:s0 constant that appears in KernelSU's Natives.kt:
+	 * that one is only the *default value an App Profile starts from*, not
+	 * the domain a real su session lands in.  Getting this wrong is exactly
+	 * the kind of tell we are trying to avoid, since u:r:su:s0 is the old
+	 * Magisk domain and reads as "old Magisk" rather than "KernelSU".
+	 * kernel:s0 would be worse still -- that is init's domain, shared with
+	 * the rest of uid 0's 24 observed domains. */
 	if (name == NULL || name[0] == '\0' || strcmp(name, "root") == 0)
-		return "u:r:su:s0";
+		return "u:r:ksu:s0";
 	if (strcmp(name, "shell") == 0)
 		return "u:r:shell:s0";
 
