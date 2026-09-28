@@ -4124,6 +4124,102 @@ int main(int argc, char **argv)
 		}
 		fclose(cf);
 	}
+	/* Set when uid 2000 was answered by the bridge itself.  The /proc scan
+	 * below must not run in that case: it would accept any process that
+	 * happens to be uid 2000, and a daemon with two groups was picked over
+	 * the main shell, which is how "su 2000" once reported three groups
+	 * instead of fifteen. */
+	int exact = 0;
+	if (g_suppg_cnt == 0) {
+		/* Identity comes from real processes, not from the package
+		 * database.  dumpsys package reports the AIDs PackageManager
+		 * *granted* to a package, which is not the group set a process
+		 * actually runs with; measured against adbd's own `rishq id` the
+		 * two agreed on 7 of 15 groups.  adbd's groups come from
+		 * /system/etc/group and init, so that is the set a genuine
+		 * uid-2000 process carries, and that is what a genuine
+		 * "su 2000" would present.
+		 *
+		 * Two notes on the shape of the answer, both of which matter
+		 * for how it is used:
+		 *
+		 *  - Groups are per-process, not per-uid.  The scan below turns
+		 *    up several distinct group sets for uid 0 alone, because
+		 *    supplementary groups belong to the process.  "The groups of
+		 *    uid 1000" is not a well-defined question, which is why the
+		 *    first real process found is taken as representative rather
+		 *    than pretending to a single authoritative answer.
+		 *  - A real KSU session does not consult a database either; ksud
+		 *    carries an explicit groups=[...] in its profile template and
+		 *    calls setgroups with it.  So a plausible group set is what
+		 *    identity simulation can deliver, and matching one process
+		 *    on the device is a better fit than matching a grant list.
+		 *
+		 * For com.android.shell the bridge is itself such a process, so
+		 * that one is exact: `id -G` is a bare word with nothing for a
+		 * nested shell to mangle, which is not a trivial concern given
+		 * that an earlier sed-based scan came back with the wrong
+		 * process's groups. */
+		if (g_uid == 2000) {
+			char *idout = NULL;
+			size_t idlen = 0;
+			if (rishq_query("id -G", &idout, &idlen) == 0
+			    && idout != NULL) {
+				char *save = NULL;
+				int first = 1;
+				for (char *tok = strtok_r(idout, " \t\r\n", &save);
+				     tok != NULL && g_suppg_cnt < SUPP_GID_MAX;
+				     tok = strtok_r(NULL, " \t\r\n", &save)) {
+					long gv;
+					if (!valid_uint_str(tok, &gv))
+						continue;
+					/* `id -G` leads with the primary gid,
+					 * which g_gid already carries. */
+					if (first++ == 0 || gv == g_gid)
+						continue;
+					g_suppg[g_suppg_cnt++] = strdup(tok);
+				}
+			}
+			exact = 1;
+		}
+	}
+	if (g_suppg_cnt == 0 && !exact) {
+		char *scan = NULL;
+		size_t scanlen = 0;
+		const char *cmd =
+		    "for f in /proc/[0-9]*/status; do "
+		    "awk -F'[\\t ]+' '/^Uid:/{u=$2} /^Groups:/{g=$0; "
+		    "sub(/^Groups:[\\t ]*/,\"\",g); print u\"|\"g}' \"$f\" "
+		    "2>/dev/null; done";
+		if (rishq_query(cmd, &scan, &scanlen) == 0 && scan != NULL) {
+			char *save = NULL;
+			for (char *ln = strtok_r(scan, "\n", &save);
+			     ln != NULL && g_suppg_cnt < SUPP_GID_MAX;
+			     ln = strtok_r(NULL, "\n", &save)) {
+				char *bar = strchr(ln, '|');
+				if (bar == NULL)
+					continue;
+				*bar = '\0';
+				char *end;
+				long cu = strtol(ln, &end, 10);
+				if (end == ln || cu != g_uid)
+					continue;
+				char *gsave = NULL;
+				for (char *tok = strtok_r(bar + 1, " \t\r", &gsave);
+				     tok != NULL && g_suppg_cnt < SUPP_GID_MAX;
+				     tok = strtok_r(NULL, " \t\r", &gsave)) {
+					long gv;
+					if (!valid_uint_str(tok, &gv)
+					    || gv < 0 || gv > 0x7fffffffL)
+						continue;
+					if (gv == g_gid)
+						continue;
+					g_suppg[g_suppg_cnt++] = strdup(tok);
+				}
+				break;
+			}
+		}
+	}
 	if (g_suppg_cnt == 0) {
 		char pkg[160];
 		long tsdk;
