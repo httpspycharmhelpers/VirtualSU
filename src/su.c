@@ -2790,13 +2790,20 @@ static void gen_fake_status(void)
 			repl = tmp;
 		} else if (strncmp(line, "CapInh:", 7) == 0)
 			repl = "CapInh:\t0000000000000000\n";
+		/* The capability sets are per-uid, not a root-or-nothing switch.
+		 * Measured on this device: uid 0 has all 38 bits this kernel
+		 * implements (0x3fffffffff); a non-root shell has CapPrm/CapEff 0
+		 * but a non-empty CapBnd, because setuid() clears the first two
+		 * and leaves the bounding set inherited from the root parent
+		 * alone; and system_server runs with a rich CapEff of its own
+		 * (0x1806897c20) that has nothing to do with being root. */
 		else if (strncmp(line, "CapPrm:", 7) == 0)
 			repl = g_uid == 0 && !g_drop_cap
-				? "CapPrm:\t000001ffffffffff\n"
+				? "CapPrm:\t0000003fffffffff\n"
 				: "CapPrm:\t0000000000000000\n";
 		else if (strncmp(line, "CapEff:", 7) == 0)
 			repl = g_uid == 0 && !g_drop_cap
-				? "CapEff:\t000001ffffffffff\n"
+				? "CapEff:\t0000003fffffffff\n"
 				: "CapEff:\t0000000000000000\n";
 		else if (strncmp(line, "CapBnd:", 7) == 0)
 			/* setuid() does not touch the bounding set; only
@@ -2808,7 +2815,7 @@ static void gen_fake_status(void)
 			 * CapPrm/CapEff are 0 there but CapBnd is not. */
 			repl = g_drop_cap
 				? "CapBnd:\t0000000000000000\n"
-				: "CapBnd:\t000001ffffffffff\n";
+				: "CapBnd:\t0000003fffffffff\n";
 		else if (strncmp(line, "CapAmb:", 7) == 0)
 			repl = "CapAmb:\t0000000000000000\n";
 		/* PRoot runs its tracee with NoNewPrivs=1 and a seccomp filter

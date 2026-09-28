@@ -557,13 +557,20 @@ static void afakesu_regen_status_for_pid(pid_t pid)
 			repl = ctxbuf;
 		} else if (strncmp(line, "CapInh:", 7) == 0) {
 			repl = "CapInh:\t0000000000000000\n";
+		/* Width measured from the device, not assumed: this kernel gives
+		 * uid 0 all 38 bits it implements (0x3fffffffff).  The wider
+		 * 0x1ffffffffff that used to be here advertised CAP_PERFMON,
+		 * CAP_BPF and CAP_CHECKPOINT_RESTORE, none of which exist here,
+		 * so a root session claimed capabilities the kernel cannot
+		 * grant.  A non-root persona keeps CapPrm/CapEff 0 and a full
+		 * CapBnd, which is what setuid() actually leaves behind. */
 		} else if (strncmp(line, "CapPrm:", 7) == 0) {
 			repl = uid == 0 && !g_drop_cap
-				? "CapPrm:\t000001ffffffffff\n"
+				? "CapPrm:\t0000003fffffffff\n"
 				: "CapPrm:\t0000000000000000\n";
 		} else if (strncmp(line, "CapEff:", 7) == 0) {
 			repl = uid == 0 && !g_drop_cap
-				? "CapEff:\t000001ffffffffff\n"
+				? "CapEff:\t0000003fffffffff\n"
 				: "CapEff:\t0000000000000000\n";
 		} else if (strncmp(line, "CapBnd:", 7) == 0) {
 			/* Inherited whole from the root su parent: setuid()
@@ -571,7 +578,7 @@ static void afakesu_regen_status_for_pid(pid_t pid)
 			 * still shows it full while CapPrm/CapEff are 0. */
 			repl = g_drop_cap
 				? "CapBnd:\t0000000000000000\n"
-				: "CapBnd:\t000001ffffffffff\n";
+				: "CapBnd:\t0000003fffffffff\n";
 		} else if (strncmp(line, "CapAmb:", 7) == 0) {
 			/* Ambient caps are only ever non-zero when a process
 			 * explicitly raises them with prctl, which neither
