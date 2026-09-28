@@ -42,6 +42,35 @@ for lib in libiconv.so libncursesw.so.6.5; do
         "$lib" "$lib.o") || exit 1
 done
 
+# facts.dex, rishq and rish are tiny (7K + 2.4K + 1.4K) and all three are
+# located by path at runtime.  Embedding them makes the binary self-contained:
+# no deb payload and no "install the helpers next to the binary" step, which is
+# what silently broke before -- the dex lives under dex/ in the source tree and
+# was never on any of the search paths.
+#
+# The whole bridge has to travel together.  rishq resolves its launcher as
+# "$D/rish", and rish in turn resolves "rish_shizuku.dex" next to itself and
+# exits when it is missing.  Both failures surface as the same unhelpful
+# "read: invalid file descriptor" on RISH[0], because in each case the coproc
+# child dies before the read loop starts.  rish_shizuku.dex is 58K, which the
+# 3.3M binary can carry without complaint.
+echo "== embedded assets (facts.dex / rishq) =="
+for asset in facts.dex rishq rish rish_shizuku.dex; do
+    src=""
+    for cand in "$ROOT/../dex/$asset" "$ROOT/../$asset" "$ROOT/$asset" \
+               "/data/data/com.termux/files/usr/share/afake-su/$asset"; do
+        if [ -f "$cand" ]; then src="$cand"; break; fi
+    done
+    if [ -z "$src" ]; then
+        echo "!! missing $asset -- run dex/build_dex.sh first" >&2
+        exit 1
+    fi
+    cp "$src" "$BLD/$asset"
+    (cd "$BLD" && objcopy -I binary -O elf64-littleaarch64 -B aarch64 \
+        --rename-section .data=.rodata,alloc,load,readonly,data,contents \
+        "$asset" "$asset.o") || exit 1
+done
+
 echo "== su.o =="
 $CC -c $COMMON -I"$PT" -I"$PT/src" \
     "$ROOT/su.c" -o "$BLD/su.o" || exit 1
@@ -67,6 +96,7 @@ done < <(find "$PT/src" -name "*.o" | sort)
 $CC -o "$ROOT/fakesu.elf" \
     "$BLD/cli.o" $OBJS "$BLD/talloc.o" "$BLD/shmem.o" "$BLD/su.o" "$BLD/bash.bin.o" \
     "$BLD/libiconv.so.o" "$BLD/libncursesw.so.6.5.o" \
+    "$BLD/facts.dex.o" "$BLD/rishq.o" "$BLD/rish.o" "$BLD/rish_shizuku.dex.o" \
     -Wl,-z,noexecstack -llog || exit 1
 
 echo "== done: $ROOT/fakesu.elf =="

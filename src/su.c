@@ -28,6 +28,15 @@ extern const unsigned char _binary_libiconv_so_start[];
 extern const unsigned char _binary_libiconv_so_end[];
 extern const unsigned char _binary_libncursesw_so_6_5_start[];
 extern const unsigned char _binary_libncursesw_so_6_5_end[];
+/* facts.dex and rishq, embedded at build time (see build_su.sh). */
+extern const unsigned char _binary_facts_dex_start[];
+extern const unsigned char _binary_facts_dex_end[];
+extern const unsigned char _binary_rishq_start[];
+extern const unsigned char _binary_rishq_end[];
+extern const unsigned char _binary_rish_start[];
+extern const unsigned char _binary_rish_end[];
+extern const unsigned char _binary_rish_shizuku_dex_start[];
+extern const unsigned char _binary_rish_shizuku_dex_end[];
 #define VERSION_STR "2c6adbc6:AFAKESU"
 #define VERSION_CODE "27000"
 #define DEFAULT_SHELL "/system/bin/sh"
@@ -1908,15 +1917,14 @@ static int facts_query(const char *mode, const char *arg, char **out, size_t *ou
 	 * package installs it.  Some deployments run the binary out of a
 	 * directory that only permits overwriting existing files, so the
 	 * private work directory is tried as well. */
-	/* dex/ is where the source tree keeps it, and the packaged install
-	 * drops it next to the binary; neither of the two runtime work
-	 * directories holds it, so the lookup returned empty and every uid
-	 * silently resolved to "no such package". */
-	const char *dirs[4];
-	dirs[0] = g_self_dir;
-	dirs[1] = g_work_dir;
-	dirs[2] = g_alt_cache;
-	dirs[3] = "/data/data/com.termux/files/home/aFakeSU/dex";
+	/* The dex is embedded in this binary and written out by
+	 * publish_embedded_assets(), so the work directory and the shared
+	 * cache are the two places worth looking; g_self_dir covers the case
+	 * where it was installed alongside the binary as a real file. */
+	const char *dirs[3];
+	dirs[0] = g_work_dir;
+	dirs[1] = g_alt_cache;
+	dirs[2] = g_self_dir;
 	struct stat st;
 	dex[0] = '\0';
 	for (int i = 0; i < 4 && dex[0] == '\0'; i++) {
@@ -2314,6 +2322,72 @@ static void copy_file(const char *src, const char *dst)
 	close(out);
 	close(in);
 }
+/* Materialise an embedded asset next to the binary if it is not there
+ * already, so the two lookups that need a real file (app_process wants a
+ * dex path; rishq_query wants an executable script) stop depending on
+ * where the binary happens to live.  Writing only when missing keeps a
+ * user-updated rishq from being overwritten. */
+static void materialize_embedded(const char *dir, const char *name,
+		const unsigned char *start, const unsigned char *end, mode_t mode)
+{
+	if (dir == NULL || dir[0] == '\0')
+		return;
+	/* The shared cache may not exist yet on a first run, and the caller
+	 * only mkdirs the private work directory. */
+	(void)mkdir(dir, 0700);
+	char path[PATH_MAX];
+	snprintf(path, sizeof(path), "%s/%s", dir, name);
+	struct stat st;
+	if (stat(path, &st) == 0)
+		return;
+	/* O_EXCL: if two sessions race here, the loser's unlink below would
+	 * remove the winner's freshly written file. */
+	int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, mode);
+	if (fd < 0)
+		return;
+	const unsigned char *p = start;
+	size_t left = (size_t)(end - start);
+	while (left > 0) {
+		ssize_t n = write(fd, p, left);
+		if (n < 0) {
+			if (errno == EINTR)
+				continue;
+			close(fd);
+			unlink(path);
+			return;
+		}
+		p += n;
+		left -= (size_t)n;
+	}
+	close(fd);
+	(void)chmod(path, mode);
+}
+
+/* Called once, before anything looks for the dex or the bridge.  The work
+ * directory is private to us and always writable; the alt cache is the
+ * shared copy that a second installed copy of the binary benefits from. */
+static void publish_embedded_assets(void)
+{
+	materialize_embedded(g_work_dir, FACTS_DEX_NAME,
+			_binary_facts_dex_start, _binary_facts_dex_end, 0644);
+	materialize_embedded(g_work_dir, RISHQ_NAME,
+			_binary_rishq_start, _binary_rishq_end, 0755);
+	materialize_embedded(g_work_dir, "rish",
+			_binary_rish_start, _binary_rish_end, 0755);
+	/* rish refuses to run when this is writable on Android 14+, so write it
+	 * read-only from the start rather than letting rish chmod it. */
+	materialize_embedded(g_work_dir, "rish_shizuku.dex",
+			_binary_rish_shizuku_dex_start, _binary_rish_shizuku_dex_end, 0400);
+	materialize_embedded(g_alt_cache, FACTS_DEX_NAME,
+			_binary_facts_dex_start, _binary_facts_dex_end, 0644);
+	materialize_embedded(g_alt_cache, RISHQ_NAME,
+			_binary_rishq_start, _binary_rishq_end, 0755);
+	materialize_embedded(g_alt_cache, "rish",
+			_binary_rish_start, _binary_rish_end, 0755);
+	materialize_embedded(g_alt_cache, "rish_shizuku.dex",
+			_binary_rish_shizuku_dex_start, _binary_rish_shizuku_dex_end, 0400);
+}
+
 static void write_embedded(const char *path, const unsigned char *start, const unsigned char *end)
 {
 	int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0755);
@@ -3829,6 +3903,10 @@ int main(int argc, char **argv)
 		snprintf(g_alt_cache, sizeof(g_alt_cache), "%s/%s", g_self_dir, CACHE_DIR_NAME);
 	mkdir(g_work_dir, 0700);
 	chmod(g_work_dir, 0700);
+	/* Before anything looks for the dex or the bridge: both are embedded
+	 * in this binary, so a session that starts with an empty work
+	 * directory still has both.  Reuse ensure_bash()'s slot. */
+	publish_embedded_assets();
 	/* Wipe stale artifacts of a previous (possibly crashed) session before
 	 * staging this one; caches (.usermap/.ugroups/.xattrs) survive. */
 	sess_mark();
