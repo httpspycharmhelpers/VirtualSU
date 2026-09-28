@@ -64,6 +64,9 @@ char g_fake_comm[64] = "sh";
 static char *g_cmd = NULL;
 static size_t g_cmd_cap = 0, g_cmd_len = 0;
 static const char *g_grp = NULL;
+/* Android's SUPP_GROUPS_MAX is 32; leave headroom for a device with a
+ * longer declared list. */
+#define SUPP_GID_MAX 64
 static const char **g_suppg = NULL;
 static size_t g_suppg_cnt = 0;
 
@@ -910,84 +913,12 @@ static void aid_real_patch(void)
 	fclose(f);
 	rename(tmp, path);
 	free(out);
-
-	/* Harvest real per-uid supplementary groups from live processes
-	 * (/proc/<pid>/status "Groups:"), so each su <user> keeps the group
-	 * memberships that uid actually carries on this device (which can
-	 * differ from the canonical single-gid assumption). */
-	char gpath[PATH_MAX], gtmp[PATH_MAX];
-	snprintf(gpath, sizeof(gpath), "%s/.ugroups", g_work_dir);
-	snprintf(gtmp, sizeof(gtmp), "%s/.ugroups.tmp", g_work_dir);
-	out = NULL;
-	outlen = 0;
-	if (rishq_query(
-	    "for d in /proc/[0-9]*; do s=\"$d/status\"; [ -r \"$s\" ] || continue; "
-	    "u=$(sed -n 's/^Uid:[[:space:]]*\\([0-9][0-9]*\\).*/\\1/p' \"$s\"); "
-	    "[ -n \"$u\" ] || continue; "
-	    "g=$(sed -n 's/^Groups:[[:space:]]*//p' \"$s\"); "
-	    "[ -n \"$g\" ] || g=0; "
-	    "echo \"$u:$g\"; done 2>/dev/null | sort -u", &out, &outlen) != 0) {
-		free(out);
-		return;
-	}
-	f = fopen(gtmp, "w");
-	if (f == NULL) {
-		free(out);
-		return;
-	}
-	if (out != NULL) {
-		/* One line per uid, and it must be the same line on every harvest:
-		 * a uid can have several live processes with different group sets
-		 * (uid 0 had six, uid 2000 had three), so "keep the first" made the
-		 * answer depend on harvest order.  The most frequent set wins. */
-		struct { long uid; char g[256]; int n; } best[512];
-		int nb = 0;
-		char *save = NULL;
-		for (char *line = strtok_r(out, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
-			if (strncmp(line, "999999999:", 10) == 0)
-				continue;
-			char *colon = strchr(line, ':');
-			if (colon == NULL)
-				continue;
-			char *end;
-			long u = strtol(line, &end, 10);
-			if (end != colon || u < 0 || u > 0x7fffffffL)
-				continue;
-			char *g = colon + 1;
-			while (*g == ' ' || *g == '\t')
-				g++;
-			int i;
-			for (i = 0; i < nb; i++)
-				if (best[i].uid == u && strcmp(best[i].g, g) == 0) {
-					best[i].n++;
-					break;
-				}
-			if (i < nb)
-				continue;
-			if (nb >= (int)(sizeof(best) / sizeof(best[0])))
-				continue;
-			best[nb].uid = u;
-			snprintf(best[nb].g, sizeof(best[nb].g), "%s", g);
-			best[nb].n = 1;
-			nb++;
-		}
-		for (int i = 0; i < nb; i++) {
-			int bi = i;
-			for (int k = i + 1; k < nb; k++)
-				if (best[k].n > best[bi].n)
-					bi = k;
-			if (bi != i) {
-				typeof(best[0]) tmp = best[i];
-				best[i] = best[bi];
-				best[bi] = tmp;
-			}
-			fprintf(f, "%ld:%s\n", best[i].uid, best[i].g);
-		}
-	}
-	fclose(f);
-	rename(gtmp, gpath);
-	free(out);
 }
+
+/* The supplementary-group lookup for a single uid lives in the session
+ * setup path (see the "No explicit -g/-s given" block in main), because
+ * it needs PackageManager and the session's own uid, neither of which
+ * exists at harvest time. */
 static const char *aid_name_for_uid(long uid, char *name, size_t namesz)
 {
 	char *table = strdup(aid_merged_table());
@@ -1977,12 +1908,18 @@ static int facts_query(const char *mode, const char *arg, char **out, size_t *ou
 	 * package installs it.  Some deployments run the binary out of a
 	 * directory that only permits overwriting existing files, so the
 	 * private work directory is tried as well. */
-	const char *dirs[2];
+	/* dex/ is where the source tree keeps it, and the packaged install
+	 * drops it next to the binary; neither of the two runtime work
+	 * directories holds it, so the lookup returned empty and every uid
+	 * silently resolved to "no such package". */
+	const char *dirs[4];
 	dirs[0] = g_self_dir;
 	dirs[1] = g_work_dir;
+	dirs[2] = g_alt_cache;
+	dirs[3] = "/data/data/com.termux/files/home/aFakeSU/dex";
 	struct stat st;
 	dex[0] = '\0';
-	for (int i = 0; i < 2 && dex[0] == '\0'; i++) {
+	for (int i = 0; i < 4 && dex[0] == '\0'; i++) {
 		if (dirs[i] == NULL || dirs[i][0] == '\0')
 			continue;
 		char cand[PATH_MAX];
@@ -2028,14 +1965,18 @@ static int rishq_query(const char *cmd, char **out, size_t *outlen)
 	 * binary's own directory made the harvest fail silently for every copy
 	 * but one: no rishq, no exception, no caches, and the session then ran
 	 * with empty device facts.  Look in all three known places. */
-	const char *qdirs[3];
+	const char *qdirs[4];
 	qdirs[0] = g_self_dir;
 	qdirs[1] = g_work_dir;
 	qdirs[2] = g_alt_cache;
+	/* The packaged install puts rishq in the app's bin dir, which is not
+	 * any of the three runtime directories above; without it the harvest
+	 * silently found nothing and every session fell back to bare gids. */
+	qdirs[3] = "/data/data/com.termux/files/usr/bin";
 	char rishq_path[PATH_MAX];
 	rishq_path[0] = '\0';
 	struct stat st;
-	for (int i = 0; i < 3 && rishq_path[0] == '\0'; i++) {
+	for (int i = 0; i < 4 && rishq_path[0] == '\0'; i++) {
 		if (qdirs[i] == NULL || qdirs[i][0] == '\0')
 			continue;
 		char cand[PATH_MAX];
@@ -2059,12 +2000,21 @@ static int rishq_query(const char *cmd, char **out, size_t *outlen)
 	}
 	char bash_path[PATH_MAX];
 	bash_path[0] = '\0';
-	for (int i = 0; i < 3 && bash_path[0] == '\0'; i++) {
-		if (qdirs[i] == NULL || qdirs[i][0] == '\0')
+	/* Every candidate must actually be executable by us.  stat() alone
+	 * is not enough: /data/local/tmp/bash exists with a setuid bit this
+	 * uid cannot use, so exec fails with EACCES and every harvest dies
+	 * on a path that "exists".  Skip to the next one instead. */
+	const char *bdirs[4];
+	bdirs[0] = g_self_dir;
+	bdirs[1] = g_alt_cache;
+	bdirs[2] = "/data/data/com.termux/files/usr/bin";
+	bdirs[3] = g_work_dir;
+	for (int i = 0; i < 4 && bash_path[0] == '\0'; i++) {
+		if (bdirs[i] == NULL || bdirs[i][0] == '\0')
 			continue;
 		char cand[PATH_MAX];
-		snprintf(cand, sizeof(cand), "%s/bash", qdirs[i]);
-		if (stat(cand, &st) == 0)
+		snprintf(cand, sizeof(cand), "%s/bash", bdirs[i]);
+		if (access(cand, X_OK) == 0 && stat(cand, &st) == 0)
 			snprintf(bash_path, sizeof(bash_path), "%s", cand);
 	}
 	int rc;
@@ -3882,7 +3832,12 @@ int main(int argc, char **argv)
 	linker_config_setup();
 	aid_files_setup();
 	g_pos = malloc(sizeof(char *) * (size_t)(argc + 1));
-	g_suppg = malloc(sizeof(char *) * (size_t)(argc + 1));
+	/* The cap has to cover the device's own group list, not this
+	 * command line: the gids harvest can legitimately return dozens of
+	 * entries, and sizing the array by argc truncated it to whatever the
+	 * user's argv happened to be (11 gids became 4 on "su 2000 -c id",
+	 * because argc is 5 there). */
+	g_suppg = malloc(sizeof(char *) * (SUPP_GID_MAX + 1));
 	if (!g_pos || !g_suppg) {
 		perror("malloc");
 		return 1;
@@ -4000,42 +3955,80 @@ int main(int argc, char **argv)
 			invalid_gid(g_suppg[0]);
 		g_gid = v;
 	}
-	/* No explicit -g/-s given: attach the groups this uid really has on the
-	 * device (harvested to .ugroups) instead of assuming a single canonical
-	 * gid — the real membership may be anything, not just the uid's own. */
+	/* No explicit -g/-s given: ask PackageManager what groups this uid's
+	 * package actually carries, so "su 2000" lands with the 11 gids that
+	 * com.android.shell declares rather than bare gid 2000.
+	 *
+	 * PackageManager is consulted on demand, once per session, instead of
+	 * being pre-harvested for every uid: the table would have to be written
+	 * by the rish shell (uid 2000) into the app's private directory, which
+	 * it cannot do, so a pre-harvested cache silently never existed. */
 	if (g_suppg_cnt == 0) {
-		char gp[PATH_MAX];
-		snprintf(gp, sizeof(gp), "%s/.ugroups", g_work_dir);
-		FILE *gf = fopen(gp, "r");
-		if (gf) {
-			char line[1024];
-			while (fgets(line, sizeof(line), gf) != NULL) {
-				char *colon = strchr(line, ':');
-				if (colon == NULL)
-					continue;
-				long u;
-				char *end;
-				u = strtol(line, &end, 10);
-				if (end != colon || u != g_uid)
-					continue;
-				char *save = NULL;
-				for (char *tok = strtok_r(colon + 1, " \t\r\n", &save);
-				     tok != NULL && g_suppg_cnt < (size_t) argc;
-				     tok = strtok_r(NULL, " \t\r\n", &save)) {
-					long gv;
-					if (!valid_uint_str(tok, &gv)
-					    || gv < 0 || gv > 0x7fffffffL)
+		char pkg[160];
+		long tsdk;
+		int isys, ipriv;
+		if (apptab_lookup(g_uid, &tsdk, &isys, pkg, sizeof(pkg), &ipriv)) {
+			char cmd[256];
+			snprintf(cmd, sizeof(cmd), "dumpsys package %s 2>/dev/null", pkg);
+			char *out = NULL;
+			size_t outlen = 0;
+			if (rishq_query(cmd, &out, &outlen) == 0 && out != NULL) {
+				/* gids=[...] only appears under this package's own User
+				 * block, and a single-package dump has exactly one such
+				 * header, so there is nothing to disambiguate.  The first
+				 * entry is the primary gid, the rest are supplementary. */
+				/* The two strtok_r loops below must not share a cursor.
+				 * strtok_r(NULL, ...) continues from whatever *save
+				 * was last handed, so using one cursor for both the
+				 * line loop and the token loop makes the line loop
+				 * resume mid-line: the 11 gids were cut off after 4
+				 * (3003) because the token scan had already advanced
+				 * the shared state past the newline. */
+				char *save = NULL, *tsave = NULL;
+				for (char *line = strtok_r(out, "\n", &save); line;
+				     line = strtok_r(NULL, "\n", &save)) {
+					char *key = line;
+					while (*key == ' ' || *key == '\t')
+						key++;
+					char *lb = strchr(line, '[');
+					if (lb == NULL || strncmp(key, "gids=", 5) != 0)
 						continue;
-					/* Primary gid stays the resolved one (AID gid == uid);
-					 * the real device membership only fills the
-					 * supplementary list. */
-					if (gv == g_gid)
-						continue;
-					g_suppg[g_suppg_cnt++] = strdup(tok);
+					for (char *tok = strtok_r(lb + 1, " \t,]\r\n", &tsave);
+					     tok != NULL && g_suppg_cnt < SUPP_GID_MAX;
+					     tok = strtok_r(NULL, " \t,]\r\n", &tsave)) {
+						long gv;
+						if (!valid_uint_str(tok, &gv)
+						    || gv < 0 || gv > 0x7fffffffL)
+							continue;
+						if (gv == g_gid)
+							continue;
+						g_suppg[g_suppg_cnt++] = strdup(tok);
+					}
+					break;
 				}
-				break;
+				free(out);
 			}
+		}
+	}
+	/* Publish the resolved supplementary groups for enter.c, which
+	 * rewrites /proc/<pid>/status in the tracee and cannot ask Package
+	 * Manager itself: by then the bridge is closed and the tracee runs
+	 * as the target uid.  The format is the uid followed by a colon and
+	 * the space-separated list. */
+	{
+		char gp[PATH_MAX], gt[PATH_MAX];
+		snprintf(gp, sizeof(gp), "%s/.ugroups", g_work_dir);
+		snprintf(gt, sizeof(gt), "%s/.ugroups.tmp", g_work_dir);
+		FILE *gf = fopen(gt, "w");
+		if (gf != NULL) {
+			fprintf(gf, "%ld:", g_uid);
+			if (g_suppg_cnt > 0)
+				fprintf(gf, " %s", g_suppg[0]);
+			for (size_t k = 1; k < g_suppg_cnt; k++)
+				fprintf(gf, " %s", g_suppg[k]);
+			fputc('\n', gf);
 			fclose(gf);
+			rename(gt, gp);
 		}
 	}
 	ensure_current_uid_in_files();
