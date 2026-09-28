@@ -753,11 +753,35 @@ static bool valid_uint_str(const char *s, long *out);
  * compiled-in baseline made the answer available without any harvest at
  * all.  One failed attempt disables the rest for this process. */
 static int rishq_broken = 0;
+/* Consecutive hard failures tolerated before the bridge is declared gone.
+ * A single miss is usually Shizuku still coming up. */
+#define RISHQ_FAIL_LIMIT 3
+static int rishq_fail_streak = 0;
 
+/* Append the oem_# auto-named ranges AOSP reserves (2900-2999 vendor,
+ * 5000-5999 second oem range): every value in these ranges exists as a
+ * resolvable user/group name on real devices. */
+static void aid_append_oem_range(char *merged, size_t cap, size_t *n, int lo, int hi)
+{
+	for (int u = lo; u <= hi; u++) {
+		size_t left = cap - *n;
+		if (left < 24)
+			break;
+		int w = snprintf(merged + *n, left, "oem_%d:%d\n", u, u);
+		if (w < 0)
+			break;
+		*n += (size_t)w;
+	}
+}
+/* Full, searchable identity table = static AID_USERS + the OEM/gap names
+ * + the auto-named oem ranges + the real user list fetched from the device
+ * itself via rishq (kept in workdir/.usermap).  This is what "su <user>"
+ * resolves names against, so every user the vendor actually exposes
+ * (incl. the 3000-series) has a uid<->name mapping instead of silently
+ * collapsing into root. */
 static int rishq_query(const char *cmd, char **out, size_t *outlen);
 static int facts_query(const char *mode, const char *arg, char **out, size_t *outlen);
 static int run_capture_argv_list(char **argv, char **out, size_t *outlen);
-static const char *aid_merged_table(void);
 static const char *const g_usermap_name = ".usermap";
 /* Look up "name:uid" lines in a merged table; return true when row found. */
 static bool aid_table_has_uid(const char *table, long uid)
@@ -780,27 +804,6 @@ static bool aid_table_has_uid(const char *table, long uid)
 	free(copy);
 	return res;
 }
-/* Append the oem_# auto-named ranges AOSP reserves (2900-2999 vendor,
- * 5000-5999 second oem range): every value in these ranges exists as a
- * resolvable user/group name on real devices. */
-static void aid_append_oem_range(char *merged, size_t cap, size_t *n, int lo, int hi)
-{
-	for (int u = lo; u <= hi; u++) {
-		size_t left = cap - *n;
-		if (left < 24)
-			break;
-		int w = snprintf(merged + *n, left, "oem_%d:%d\n", u, u);
-		if (w < 0)
-			break;
-		*n += (size_t)w;
-	}
-}
-/* Full, searchable identity table = static AID_USERS + the OEM/gap names
- * + the auto-named oem ranges + the real user list fetched from the device
- * itself via rishq (kept in workdir/.usermap).  This is what "su <user>"
- * resolves names against, so every user the vendor actually exposes
- * (incl. the 3000-series) has a uid<->name mapping instead of silently
- * collapsing into root. */
 static const char *aid_merged_table(void)
 {
 	static char merged[65536];
@@ -2025,19 +2028,54 @@ static int rishq_query(const char *cmd, char **out, size_t *outlen)
 		if (access(cand, X_OK) == 0 && stat(cand, &st) == 0)
 			snprintf(bash_path, sizeof(bash_path), "%s", cand);
 	}
-	int rc;
-	if (bash_path[0] != '\0')
-		rc = run_cmd_capture_argv(bash_path, rishq_path, cmd, out, outlen);
-	else
-		rc = run_cmd_capture(rishq_path, cmd, out, outlen);
-	/* Only a hard failure trips this.  Treating any non-zero status as
-	 * a broken bridge disabled harvesting for the rest of the process on
-	 * a command that had actually succeeded, which is how .seapp and
-	 * .apptab stopped being written at all. */
-	if (rc < 0 || *out == NULL)
-		rishq_broken = 1;
+	/* Retry before giving up.  Each attempt is a fresh rish session, and
+	 * the bridge is not always ready on the first try: Shizuku may still
+	 * be handing out the binder, and rishq reports that as a non-zero
+	 * exit with nothing on stdout.  The old code latched rishq_broken on
+	 * the first such miss, so whichever harvest happened to run first ate
+	 * the failure and every later query in the same process was skipped --
+	 * which is why "su 2000" came back with a bare gid while "su 1001"
+	 * in the next run got its full group set. */
+	int rc = -1;
+	for (int attempt = 0; attempt < 2; attempt++) {
+		*out = NULL;
+		*outlen = 0;
+		if (bash_path[0] != '\0')
+			rc = run_cmd_capture_argv(bash_path, rishq_path, cmd, out, outlen);
+		else
+			rc = run_cmd_capture(rishq_path, cmd, out, outlen);
+		if (rc == 0 && *out != NULL)
+			return 0;
+	}
+	/* Only a hard failure, on both attempts and with nothing to show for
+	 * it, trips this.  A non-zero status alone is not enough: the command
+	 * may simply have exited non-zero, and treating that as a dead bridge
+	 * is what silently stopped .seapp and .apptab from being written. */
+	if (rc < 0 || *out == NULL) {
+		if (++rishq_fail_streak >= RISHQ_FAIL_LIMIT)
+			rishq_broken = 1;
+	} else {
+		rishq_fail_streak = 0;
+	}
 	return rc;
 }
+static int groups_from_readproc(long uid, char **pout, size_t *poutlen)
+{
+	const char *cmd =
+	    "for f in /proc/[0-9]*/status; do "
+	    "u=$(sed -n 's/^Uid:[[:space:]]*\\([0-9]*\\).*/\\1/p' $f 2>/dev/null);"
+	    "[ -n \"$u\" ] || continue; "
+	    "p=$(sed -n 's/^Groups:[[:space:]]*//p' $f 2>/dev/null); "
+	    "echo \"$u|$p\"; done 2>/dev/null";
+	char *out = NULL;
+	size_t outlen = 0;
+	if (rishq_query(cmd, &out, &outlen) != 0 || out == NULL)
+		return -1;
+	* pout = out;
+	* poutlen = outlen;
+	return 0;
+}
+
 static bool real_snapshot_valid(void)
 {
 	char path[PATH_MAX];
@@ -4048,6 +4086,44 @@ int main(int argc, char **argv)
 	 * being pre-harvested for every uid: the table would have to be written
 	 * by the rish shell (uid 2000) into the app's private directory, which
 	 * it cannot do, so a pre-harvested cache silently never existed. */
+	/* A cached answer first.  Group membership only changes when a package
+	 * is reinstalled, so the last good harvest beats a live query that
+	 * needs a bridge which may not be running.  This is also what makes the
+	 * two requirements agree: slow first run, instant later runs. */
+	for (int ci = 0; ci < 2 && g_suppg_cnt == 0; ci++) {
+		const char *cbase = (ci == 0) ? g_alt_cache : g_work_dir;
+		if (cbase == NULL || cbase[0] == '\0')
+			continue;
+		char cpath[PATH_MAX];
+		snprintf(cpath, sizeof(cpath), "%s/.ugroups", cbase);
+		FILE *cf = fopen(cpath, "r");
+		if (cf == NULL)
+			continue;
+		char cline[1024];
+		while (fgets(cline, sizeof(cline), cf) != NULL) {
+			char *colon = strchr(cline, ':');
+			if (colon == NULL)
+				continue;
+			char *cend;
+			long cu = strtol(cline, &cend, 10);
+			if (cend != colon || cu != g_uid)
+				continue;
+			char *csave = NULL;
+			for (char *tok = strtok_r(colon + 1, " \t\r\n", &csave);
+			     tok != NULL && g_suppg_cnt < SUPP_GID_MAX;
+			     tok = strtok_r(NULL, " \t\r\n", &csave)) {
+				long gv;
+				if (!valid_uint_str(tok, &gv)
+				    || gv < 0 || gv > 0x7fffffffL)
+					continue;
+				if (gv == g_gid)
+					continue;
+				g_suppg[g_suppg_cnt++] = strdup(tok);
+			}
+			break;
+		}
+		fclose(cf);
+	}
 	if (g_suppg_cnt == 0) {
 		char pkg[160];
 		long tsdk;
@@ -4100,12 +4176,33 @@ int main(int argc, char **argv)
 	 * Manager itself: by then the bridge is closed and the tracee runs
 	 * as the target uid.  The format is the uid followed by a colon and
 	 * the space-separated list. */
+	/* Publish to the private work dir *and* the shared cache.  The cache
+	 * copy is what makes a missing bridge harmless: group membership is a
+	 * device fact that only changes when a package is reinstalled, so a
+	 * later session that cannot reach Shizuku reads the last good answer
+	 * instead of degrading to a bare gid.  Without it, "su 2000" returned
+	 * 11 gids or 1 depending on whether the bridge was awake, which is the
+	 * worst possible failure mode -- it makes the answer look arbitrary. */
 	{
-		char gp[PATH_MAX], gt[PATH_MAX];
-		snprintf(gp, sizeof(gp), "%s/.ugroups", g_work_dir);
-		snprintf(gt, sizeof(gt), "%s/.ugroups.tmp", g_work_dir);
-		FILE *gf = fopen(gt, "w");
-		if (gf != NULL) {
+		const char *bases[2];
+		bases[0] = g_work_dir;
+		bases[1] = g_alt_cache;
+		(void)mkdir(g_alt_cache, 0700);
+		for (int bi = 0; bi < 2; bi++) {
+			if (bases[bi] == NULL || bases[bi][0] == '\0')
+				continue;
+			char gp[PATH_MAX], gt[PATH_MAX];
+			snprintf(gp, sizeof(gp), "%s/.ugroups", bases[bi]);
+			snprintf(gt, sizeof(gt), "%s/.ugroups.tmp", bases[bi]);
+			/* Never publish an empty line: with the bridge down
+			 * g_suppg_cnt is 0, and writing "2000:" would overwrite
+			 * the last good answer with nothing and destroy the very
+			 * cache this exists to provide. */
+			if (g_suppg_cnt == 0)
+				continue;
+			FILE *gf = fopen(gt, "w");
+			if (gf == NULL)
+				continue;
 			fprintf(gf, "%ld:", g_uid);
 			if (g_suppg_cnt > 0)
 				fprintf(gf, " %s", g_suppg[0]);
