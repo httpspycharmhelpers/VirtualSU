@@ -21,3 +21,12 @@ src/.aFakeSU/
 /dist/
 dex/out/
 afake-su.elf
+
+# 旧时代产物（早期模仿 Magisk/KernelSU 的残留）与采集数据，不入库
+/交接文档.md
+/magiskd
+/probe/
+/rish_src_cfr/
+/selinux/
+/adb
+/ref/
