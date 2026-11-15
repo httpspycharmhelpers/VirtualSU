@@ -83,7 +83,7 @@ vsu [选项] [-] [user [argument...]]
 - **系统属性**：`getprop / setprop / resetprop` 包装器，键值持久化在 `<workdir>/.props`。
 - **分区写**：`/system`、`/vendor`、`/product`、`/odm`、`/` 的写操作重定向到 `<workdir>/ov/`，`stat` 仍报 `root:root` 与真实 mode/size。
 - **mount**：接受并记忆 `-o remount,rw/ro`，`mount` 输出按需改写。
-- **chcon / restorecon**：写入的标签存进 `<workdir>/.xattrs/`，`ls -Z` 据此显示；未覆盖路径与非覆盖查询走真实 xattr。
+- **chcon / restorecon**：写入的标签按**规范化后的绝对路径**存进 `<workdir>/.xattrs/`，`ls -Z` 据此显示（相对/绝对写法指向同一文件时命中同一条）；未覆盖路径与非覆盖查询走真实 xattr。
 - **/proc 视图**：`status`、`cmdline`、`comm`、`maps`、`attr`。
 - **身份边界**：只有 Vsud 及其子树是 `root` + `virtu_su`；设备其余进程与文件对象保留**真实**身份，祖先与无关进程不被伪造。
 

@@ -1162,10 +1162,12 @@ static bool afakesu_forge_capabilities(Tracee *tracee, word_t syscall_number)
 static bool afakesu_forge_xattr(Tracee *tracee, word_t syscall_number)
 {
 	char path[PATH_MAX];
+	char cpath[PATH_MAX];
 	const char *ctx = NULL;
 	const char *value;
 	const char *tail;
 	const char *stored;
+	const char *lookup;
 	word_t buf;
 	word_t size;
 	size_t vlen;
@@ -1208,8 +1210,24 @@ static bool afakesu_forge_xattr(Tracee *tracee, word_t syscall_number)
 	} else if (get_sysarg_path(tracee, path, SYSARG_1) < 0)
 		return false;
 
-	/* A stored chcon/restorecon label has top priority. */
-	stored = afakesu_xattr_lookup(path);
+	/* A stored chcon/restorecon label has top priority.  The store is
+	 * keyed by the guest absolute path, so a relative spelling has to be
+	 * canonicalized against the tracee's cwd exactly like the chcon
+	 * wrapper does; otherwise "chcon f" and "ls -Z /abs/f" would key the
+	 * very same file differently.  A failed canonicalization (e.g. the
+	 * path does not exist) falls back to the raw spelling. */
+	lookup = path;
+	if (path[0] == '/') {
+		if (canonicalize(tracee, path, false, cpath, 0) >= 0) {
+			chop_finality(cpath);
+			lookup = cpath;
+		}
+	} else if (getcwd2(tracee, cpath) >= 0
+		   && canonicalize(tracee, path, false, cpath, 0) >= 0) {
+		chop_finality(cpath);
+		lookup = cpath;
+	}
+	stored = afakesu_xattr_lookup(lookup);
 	if (stored != NULL) {
 		value = stored;
 		vlen = strlen(stored) + 1;
