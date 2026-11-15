@@ -22,6 +22,7 @@
 
 #include <sched.h>      /* CLONE_*,  */
 #include <sys/types.h>  /* pid_t, */
+#include <sys/prctl.h>  /* prctl(2), PR_SET_PDEATHSIG, */
 #include <sys/ptrace.h> /* ptrace(1), PTRACE_*, */
 #include <sys/types.h>  /* waitpid(2), */
 #include <sys/wait.h>   /* waitpid(2), */
@@ -98,6 +99,22 @@ int launch_process(Tracee *tracee, char *const argv[])
 		return -errno;
 
 	case 0: /* child */
+		/* event_loop() arms atexit(kill_all_tracees), but atexit
+		 * handlers do not run when the process is killed with
+		 * SIGKILL.  Without this, `kill -9` on the proot process
+		 * leaves the whole guest tree running: the kernel detaches
+		 * the ptraced tracees, re-parents them to init, and they
+		 * block forever (e.g. a guest `sh` still waiting on a pipe
+		 * whose reader is gone), each one holding a zombie child
+		 * that nobody reaps.  PR_SET_PDEATHSIG makes the kernel do
+		 * the cleanup for us, which is the only thing that still
+		 * works when we cannot run any code at all.
+		 *
+		 * Note the kernel clears PDEATHSIG in the child of a
+		 * fork(2), so this only covers the root tracee; descendants
+		 * are covered by the signal handlers below.  */
+		prctl(PR_SET_PDEATHSIG, SIGKILL);
+
 		/* SIG_IGN survives fork(2) and execve(2), so an ignored
 		 * SIGPIPE anywhere above proot is inherited by every
 		 * process of the guest: write(2) then fails with EPIPE
@@ -327,6 +344,22 @@ int event_loop()
 			/* Kill all tracees on abnormal termination
 			 * signals.  This ensures no process is left
 			 * untraced.  */
+			signal_action.sa_sigaction = kill_all_tracees2;
+			break;
+
+		case SIGTERM:
+			/* Not a terminal-generated signal, so it only ever
+			 * arrives because something asked us to stop (kill(1),
+			 * a service manager, `timeout` before it escalates).
+			 * Upstream falls through to SIG_IGN below, which
+			 * leaves those callers with a session they cannot
+			 * stop at all.  Tear the guest tree down instead.
+			 *
+			 * SIGINT stays ignored on purpose: on a tty, ^C is
+			 * delivered to the whole foreground process group,
+			 * tracees included, so the guest shell handles it
+			 * itself and survives it.  Dying here would make ^C
+			 * kill the session shell too.  */
 			signal_action.sa_sigaction = kill_all_tracees2;
 			break;
 

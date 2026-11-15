@@ -82,6 +82,7 @@ extern int g_drop_cap;
 #include "path/canon.h"
 #include "path/binding.h"
 #include "path/temp.h"
+#include "path/proc.h"
 #include "arch.h"
 
 /* Older kernel headers may lack these. */
@@ -127,6 +128,21 @@ extern char g_work_dir[PATH_MAX];
  * a uid 2000 session would report u:r:system_app:s0 because a uid 1000
  * session had started in between.  Prefer the in-process value. */
 extern const char *g_selinux_ctx;
+/* The active persona's root domain, for the fallback above. */
+extern char g_p_domain[];
+/* The session's five capability sets, as capget(2) version 3 lays them out.
+ * su.c owns them because --caps is parsed there; enter.c only reads them.
+ * These were two independent `uid == 0 && !g_drop_cap' expressions, one per
+ * file, which is how the status file and capget came to disagree. */
+struct af_capsets {
+	uint32_t inh[2];
+	uint32_t prm[2];
+	uint32_t eff[2];
+	uint32_t bnd[2];
+	uint32_t amb[2];
+};
+extern struct af_capsets g_caps;
+extern int g_caps_explicit;
 /* Second cache location; see g_alt_cache in su.c. */
 extern char g_alt_cache[PATH_MAX];
 
@@ -416,6 +432,63 @@ static bool afakesu_is_pid_match(const Tracee *tracee, const char *pidp);
 /* Regenerate the workdir "status" stand-in from the *requesting* tracee's
  * own /proc/<pid>/status, so every reader sees its real Name, memory,
  * threads etc. while the identity fields are patched to the persona. */
+/*
+ * The session's uid/gid, as su recorded them before dropping privileges.
+ * Both the forged /proc/<pid>/status and the capability answers below read
+ * it from here: they describe the same session, and when each parsed
+ * <workdir>/.uidgid separately they were free to disagree about what the
+ * session is.
+ */
+static void afakesu_session_uidgid(long *uid, long *gid)
+{
+	char up[PATH_MAX];
+	FILE *uf;
+
+	*uid = 0;
+	*gid = 0;
+	snprintf(up, sizeof(up), "%s/.uidgid", g_work_dir);
+	uf = fopen(up, "r");
+	if (uf == NULL)
+		return;
+	if (fscanf(uf, "%ld:%ld", uid, gid) != 2) {
+		*uid = 0;
+		*gid = 0;
+	}
+	fclose(uf);
+}
+
+/* True when this session is meant to look like it holds full capabilities:
+ * uid 0 and no --drop-cap.  Same condition as the CapPrm/CapEff lines of
+ * the status file, which is the point. */
+/* The empty set, for the branches that report "none of it". */
+static const uint32_t af_caps_zero[2] = { 0, 0 };
+
+static bool afakesu_session_has_caps(void)
+{
+	long uid = 0, gid = 0;
+
+	afakesu_session_uidgid(&uid, &gid);
+	return (uid == 0 || g_caps_explicit) && !g_drop_cap;
+}
+
+/* The set a given /proc line should show: the persona's, unless the uid
+ * rule says a non-root uid holds nothing and --caps did not say otherwise. */
+static const uint32_t *afakesu_caps_set(const uint32_t set[2])
+{
+	return afakesu_session_has_caps() ? set : af_caps_zero;
+}
+
+/* The single place a capability set becomes the string /proc shows. */
+static const char *afakesu_capsline(const char *label, const uint32_t w[2],
+				    char *buf, size_t cap)
+{
+	char hex[32];
+
+	snprintf(hex, sizeof(hex), "%08x%08x", w[1], w[0]);
+	snprintf(buf, cap, "%s\t%s\n", label, hex);
+	return buf;
+}
+
 static void afakesu_regen_status_for_pid(pid_t pid)
 {
 	char spath[64], line[1024];
@@ -427,18 +500,7 @@ static void afakesu_regen_status_for_pid(pid_t pid)
 		return;
 
 	long uid = 0, gid = 0;
-	{
-		char up[PATH_MAX];
-		snprintf(up, sizeof(up), "%s/.uidgid", g_work_dir);
-		FILE *uf = fopen(up, "r");
-		if (uf != NULL) {
-			if (fscanf(uf, "%ld:%ld", &uid, &gid) != 2) {
-				uid = 0;
-				gid = 0;
-			}
-			fclose(uf);
-		}
-	}
+	afakesu_session_uidgid(&uid, &gid);
 
 	char grps[1024];
 	grps[0] = '\0';
@@ -512,11 +574,15 @@ static void afakesu_regen_status_for_pid(pid_t pid)
 
 	const char *ctx = afakesu_read_session_ctx();
 	if (ctx == NULL)
-		/* Same fallback mapping as su.c:selinux_ctx_for_user(), root
-		 * sessions wear ksu (what ksud actually hardcodes), and the other
-		 * static uids keep their real domain.  The old "su:s0" here was
-		 * left over from when the root domain was wrong. */
-		ctx = uid == 0 ? "u:r:ksu:s0" : (uid == 2000 ? "u:r:shell:s0"
+		/* Same fallback mapping as su.c:selinux_ctx_for_user(), with the
+		 * root domain read from the active persona rather than spelled out
+		 * again here.  When this branch carried its own "u:r:ksu:s0"
+		 * literal it was a second source of truth: su.c moved to the
+		 * persona domain, this did not, and a session whose ctx file went
+		 * missing answered with a domain the rest of the binary had
+		 * stopped believing in.  The other static uids keep their real
+		 * domain. */
+		ctx = uid == 0 ? g_p_domain : (uid == 2000 ? "u:r:shell:s0"
 			: (uid == 1000 ? "u:r:system_app:s0"
 			: (uid >= 99000 && uid <= 99999 ? "u:r:isolated_app:s0" : NULL)));
 		if (ctx == NULL) {
@@ -535,6 +601,7 @@ static void afakesu_regen_status_for_pid(pid_t pid)
 	while (fgets(line, sizeof(line), f) != NULL) {
 		const char *repl = NULL;
 		char uidbuf[64], gidbuf[64], grpbuf[1024], ctxbuf[512];
+		char capbuf[64];
 		if (strncmp(line, "Uid:", 4) == 0) {
 			snprintf(uidbuf, sizeof(uidbuf), "Uid:\t%ld\t%ld\t%ld\t%ld\n",
 				 uid, uid, uid, uid);
@@ -570,36 +637,36 @@ static void afakesu_regen_status_for_pid(pid_t pid)
 			snprintf(ctxbuf, sizeof(ctxbuf), "Context:\t%s\n", ctx);
 			repl = ctxbuf;
 		} else if (strncmp(line, "CapInh:", 7) == 0) {
-			repl = "CapInh:\t0000000000000000\n";
-		/* Width measured from the device, not assumed: this kernel gives
-		 * uid 0 all 38 bits it implements (0x3fffffffff).  The wider
-		 * 0x1ffffffffff that used to be here advertised CAP_PERFMON,
+			repl = afakesu_capsline("CapInh:", afakesu_caps_set(g_caps.inh),
+						capbuf, sizeof(capbuf));
+		/* Every set is read from g_caps, which su.c fills in from --caps.
+		 * The width was measured on the device rather than assumed: this
+		 * kernel gives uid 0 all 38 bits it implements (0x3fffffffff).  A
+		 * wider 0x1ffffffffff once sat here, advertising CAP_PERFMON,
 		 * CAP_BPF and CAP_CHECKPOINT_RESTORE, none of which exist here,
-		 * so a root session claimed capabilities the kernel cannot
-		 * grant.  A non-root persona keeps CapPrm/CapEff 0 and a full
-		 * CapBnd, which is what setuid() actually leaves behind. */
+		 * so a root session claimed capabilities the kernel cannot grant.
+		 * A non-root uid keeps CapPrm/CapEff 0 and a full CapBnd, which is
+		 * what setuid() actually leaves behind, unless --caps named a set
+		 * for it.  The empty case is the empty case in one place, so the
+		 * five lines cannot drift apart from each other or from capget,
+		 * which reads the same words. */
 		} else if (strncmp(line, "CapPrm:", 7) == 0) {
-			repl = uid == 0 && !g_drop_cap
-				? "CapPrm:\t0000003fffffffff\n"
-				: "CapPrm:\t0000000000000000\n";
+			repl = afakesu_capsline("CapPrm:", afakesu_caps_set(g_caps.prm),
+						capbuf, sizeof(capbuf));
 		} else if (strncmp(line, "CapEff:", 7) == 0) {
-			repl = uid == 0 && !g_drop_cap
-				? "CapEff:\t0000003fffffffff\n"
-				: "CapEff:\t0000000000000000\n";
+			repl = afakesu_capsline("CapEff:", afakesu_caps_set(g_caps.eff),
+						capbuf, sizeof(capbuf));
 		} else if (strncmp(line, "CapBnd:", 7) == 0) {
-			/* Inherited whole from the root su parent: setuid()
-			 * never narrows the bounding set, so a non-root persona
-			 * still shows it full while CapPrm/CapEff are 0. */
-			repl = g_drop_cap
-				? "CapBnd:\t0000000000000000\n"
-				: "CapBnd:\t0000003fffffffff\n";
+			/* Inherited whole from the root su parent: setuid() never
+			 * narrows the bounding set, so a non-root uid still shows it
+			 * full while CapPrm/CapEff are 0.  --drop-cap is the one
+			 * thing that empties it. */
+			repl = afakesu_capsline("CapBnd:",
+						g_drop_cap ? af_caps_zero : g_caps.bnd,
+						capbuf, sizeof(capbuf));
 		} else if (strncmp(line, "CapAmb:", 7) == 0) {
-			/* Ambient caps are only ever non-zero when a process
-			 * explicitly raises them with prctl, which neither
-			 * Magisk's su nor a stock root shell does.  A real root
-			 * su session reports 0 here, so both branches are 0 and
-			 * the uid test was pointless. */
-			repl = "CapAmb:\t0000000000000000\n";
+			repl = afakesu_capsline("CapAmb:", afakesu_caps_set(g_caps.amb),
+						capbuf, sizeof(capbuf));
 		} else if (strncmp(line, "NoNewPrivs:", 11) == 0) {
 			/* PRoot runs the tracee with NNP set, because it has to
 			 * stop a setuid binary from really elevating.  A root
@@ -753,11 +820,14 @@ static bool afakesu_is_pid_match(const Tracee *tracee, const char *pidp)
 	p = (pid_t) atoi(pidbuf);
 	if (p == tracee->pid)
 		return true;
-	/* An in-session peer: any pid hosted by this PRoot (the shell,
-	 * ps, awk, ... ) must also answer like root, so `ps -AZ` shows
-	 * our whole tree with the session context while foreign
-	 * processes keep their real label. */
-	return get_tracee(tracee, p, false) != NULL;
+	/* Anything else in the privileged subtree (the su wrapper, proot,
+	 * an in-session peer such as ps or awk) answers with the session
+	 * context too, so `ps -AZ` shows one coherent tree.  Foreign
+	 * processes keep their real label -- forging the whole table would
+	 * be the giveaway, since no rooted device can relabel an unrelated
+	 * app.  proc.c owns this decision for the file-based path; both
+	 * must agree or `ls -Zd` and `ps -A -o LABEL` would contradict. */
+	return afakesu_pid_in_session(p);
 }
 
 static bool afakesu_is_own_attr_path(const Tracee *tracee, const char *path)
@@ -777,8 +847,22 @@ static bool afakesu_is_own_attr_path(const Tracee *tracee, const char *path)
 	 * the untrusted app context through it. */
 	if (strcmp(pidp, "self") == 0 || strcmp(pidp, "thread-self") == 0)
 		return true;
-	if (afakesu_is_pid_match(tracee, pidp))
-		return true;
+	/* Any numeric process node, not just our own pid.  ps(1) walks the
+	 * whole table and asks for each /proc/<pid>'s security.selinux, so
+	 * answering only for the pid we happen to be leaves every process
+	 * around us wearing the host's real untrusted_app_* label while the
+	 * guest's own tracees wear virtu_su.  That mix is worse than either
+	 * answer alone: it contradicts what attr/current and getcon() say
+	 * about the same process, and it hands out the host context and its
+	 * MCS categories for free.  Answer for every process node so the
+	 * three agree. */
+	if (pidp[0] >= '0' && pidp[0] <= '9') {
+		const char *q = pidp;
+		while (*q >= '0' && *q <= '9')
+			q++;
+		if (*q == '\0' || *q == '/')
+			return true;
+	}
 	return false;
 }
 
@@ -833,16 +917,242 @@ static const char *afakesu_xattr_lookup(const char *guest)
 }
 
 /*
+ * Map an open descriptor back to the guest path it was opened with.
+ *
+ * The f*xattr family carries an fd where getxattr carries a path, and the
+ * label store is keyed by guest path, so the fd has to become a path before
+ * the store can answer.  There is no fd table to consult: /proc/<pid>/fd/<n>
+ * is the kernel's own record of what the descriptor refers to, and PRoot is
+ * already the tracee's tracer so it may read it.  The catch is that the
+ * kernel names the *host* file, and a file the session created was opened
+ * through the overlay, so <workdir>/ov/ has to come back off to recover the
+ * path the guest actually asked for.  Without that strip every write to
+ * /system would be stored and replayed under a workdir path no guest ever
+ * uses, and the label would appear to vanish on the next call.
+ */
+static bool afakesu_fd_to_guest(const Tracee *tracee, int fd, char *out, size_t cap)
+{
+	char link[64];
+	char host[PATH_MAX];
+	char ovprefix[PATH_MAX];
+	char *del;
+	ssize_t n;
+	size_t plen;
+
+	if (fd < 0)
+		return false;
+	if (snprintf(link, sizeof(link), "/proc/%d/fd/%d", (int) tracee->pid, fd) <= 0)
+		return false;
+	n = readlink(link, host, sizeof(host) - 1);
+	if (n <= 0)
+		return false;
+	host[n] = '\0';
+
+	/* An unlinked-but-open file keeps its name with " (deleted)" glued on.
+	 * The store was keyed without that, so drop it or the lookup misses. */
+	del = strstr(host, " (deleted)");
+	if (del != NULL && del[10] == '\0')
+		*del = '\0';
+
+	if (snprintf(ovprefix, sizeof(ovprefix), "%s/ov/", g_work_dir) <= 0)
+		return false;
+	plen = strlen(ovprefix);
+	if (strncmp(host, ovprefix, plen) == 0) {
+		if (plen - 1 + strlen(host + plen) + 1 > cap)
+			return false;
+		out[0] = '/';
+		strcpy(out + 1, host + plen);
+		return true;
+	}
+	if (strlen(host) + 1 > cap)
+		return false;
+	strcpy(out, host);
+	return true;
+}
+
+/* Does this syscall return a list of names rather than one value?  Shared
+ * by the path and descriptor spellings so the two cannot drift. */
+static bool afakesu_xattr_is_list(word_t syscall_number)
+{
+	return syscall_number == PR_listxattr
+		|| syscall_number == PR_llistxattr
+		|| syscall_number == PR_flistxattr;
+}
+
+static bool afakesu_xattr_is_fd(word_t syscall_number)
+{
+	return syscall_number == PR_fgetxattr
+		|| syscall_number == PR_flistxattr
+		|| syscall_number == PR_fsetxattr
+		|| syscall_number == PR_fremovexattr;
+}
+
+/*
+ * capget/capset, answering in step with the Cap* lines of the status file.
+ *
+ * /proc/<pid>/status already reports a root session as holding every
+ * capability this kernel implements.  capget was not intercepted, so a
+ * program that asked the kernel directly -- libcap, or anything deciding
+ * whether it needs to install a seccomp filter or open a raw socket -- got
+ * the real answer: the app's own, effectively empty, set.  Two disagreeing
+ * answers about one process is worse than either being wrong alone, and the
+ * direct call is the one a program trusts.
+ *
+ * Only version 3 is answered.  It is what bionic and libcap negotiate, and
+ * it is the layout of two 32-bit words per set, which is the shape the
+ * 0x3fffffffff mask in the status file already assumes.
+ *
+ * capset records what it was handed and claims success.  The bounding set
+ * genuinely cannot be widened from in here -- nothing in this process can
+ * do that -- but remembering the request means the following capget reports
+ * what the session was told it holds, which is the arrangement the status
+ * file already has with everything else here.
+ */
+#define AF_CAPABILITY_VERSION_3 0x20080522u
+
+struct af_cap_data {
+	uint32_t effective;
+	uint32_t permitted;
+	uint32_t inheritable;
+};
+
+static struct af_cap_data af_cap_eff[2];
+static struct af_cap_data af_cap_prm[2];
+static struct af_cap_data af_cap_inh[2];
+static bool af_cap_touched;
+
+/* Seed capget's answer from the same words the status file prints, so the
+ * two cannot describe different sessions.  What the kernel would call the
+ * bounding set is not part of the capget payload, which is why only three
+ * of the five sets appear here. */
+static void afakesu_cap_reset(void)
+{
+	const uint32_t *eff = afakesu_caps_set(g_caps.eff);
+	const uint32_t *prm = afakesu_caps_set(g_caps.prm);
+	const uint32_t *inh = afakesu_caps_set(g_caps.inh);
+	int i;
+
+	for (i = 0; i < 2; i++) {
+		af_cap_eff[i].effective = eff[i];
+		af_cap_prm[i].permitted = prm[i];
+		af_cap_inh[i].inheritable = inh[i];
+	}
+	af_cap_touched = false;
+}
+
+static bool afakesu_forge_capabilities(Tracee *tracee, word_t syscall_number)
+{
+	uint32_t hdr[2];
+	word_t hdr_addr, data_addr;
+	size_t i;
+
+	if (syscall_number != PR_capget && syscall_number != PR_capset)
+		return false;
+
+	hdr_addr = peek_reg(tracee, ORIGINAL, SYSARG_1);
+	data_addr = peek_reg(tracee, ORIGINAL, SYSARG_2);
+	if (hdr_addr == 0 || data_addr == 0)
+		return false;
+	if (read_data(tracee, hdr, hdr_addr, sizeof(hdr)) < 0)
+		return false;
+
+	if (getenv("THJ_PDBG"))
+		fprintf(stderr, "THJP cap sysnum=%d ver=%08x pid=%d\n",
+			(int) syscall_number, hdr[0], (int) hdr[1]);
+
+	/* pid 0 means "the caller", which is us; the explicit form of our own
+	 * pid is the same question.  Anything else is a different process, and
+	 * answering for it would be inventing another process's capabilities
+	 * rather than describing this session -- let the kernel speak. */
+	if (hdr[1] != 0 && (pid_t) hdr[1] != tracee->pid)
+		return false;
+	if (hdr[0] != AF_CAPABILITY_VERSION_3) {
+		/* The kernel answers EINVAL for a version it does not know, and
+		 * guessing at v1/v2 (a single data word) would be answering a
+		 * question in the wrong layout. */
+		poke_reg(tracee, SYSARG_RESULT, (word_t) -EINVAL);
+		tracee->sysexit_pending = true;
+		tracee->restart_how = PTRACE_SYSCALL;
+		set_sysnum(tracee, PR_void);
+		return true;
+	}
+
+	if (!af_cap_touched)
+		afakesu_cap_reset();
+
+	if (syscall_number == PR_capset) {
+		struct af_cap_data in[2];
+
+		if (read_data(tracee, in, data_addr, sizeof(in)) >= 0) {
+			/* A capability outside the bounding set can never be held, so
+			 * the kernel answers EPERM however privileged the caller is.
+			 * Under --drop-cap the bounding set is empty (that is what
+			 * CapBnd: 0 in the status file means), which makes every
+			 * capset fail; without it the full 38 bits are available.
+			 * Claiming success unconditionally would have let a dropped
+			 * session hand itself CAP_CHOWN back and then report it,
+			 * contradicting the CapBnd line two functions away. */
+			for (i = 0; i < 2; i++) {
+				uint32_t bound = g_drop_cap ? 0 : g_caps.bnd[i];
+				uint32_t want = in[i].effective | in[i].permitted
+					| in[i].inheritable;
+
+				if ((want & ~bound) != 0) {
+					poke_reg(tracee, SYSARG_RESULT, (word_t) -EPERM);
+					tracee->sysexit_pending = true;
+					tracee->restart_how = PTRACE_SYSCALL;
+					set_sysnum(tracee, PR_void);
+					return true;
+				}
+			}
+			for (i = 0; i < 2; i++) {
+				af_cap_eff[i].effective = in[i].effective;
+				af_cap_prm[i].permitted = in[i].permitted;
+				af_cap_inh[i].inheritable = in[i].inheritable;
+			}
+			af_cap_touched = true;
+		}
+	} else {
+		struct af_cap_data out[2];
+
+		for (i = 0; i < 2; i++) {
+			out[i].effective   = af_cap_eff[i].effective;
+			out[i].permitted   = af_cap_prm[i].permitted;
+			out[i].inheritable = af_cap_inh[i].inheritable;
+		}
+		if (write_data(tracee, data_addr, out, sizeof(out)) < 0) {
+			poke_reg(tracee, SYSARG_RESULT, (word_t) -EFAULT);
+			tracee->sysexit_pending = true;
+			tracee->restart_how = PTRACE_SYSCALL;
+			set_sysnum(tracee, PR_void);
+			return true;
+		}
+	}
+
+	poke_reg(tracee, SYSARG_RESULT, 0);
+	tracee->sysexit_pending = true;
+	tracee->restart_how = PTRACE_SYSCALL;
+	set_sysnum(tracee, PR_void);
+	return true;
+}
+
+/*
  * Answer SELinux context syscalls ourselves, "like root would".
  *
  *  - setxattr/lsetxattr(security.selinux, ...): record the chcon label
  *    into the fake store and claim success (real chcon would EPERM);
  *    restorecon() writes "restore" to drop the override;
- *  - getxattr/lgetxattr: replay a stored chcon label first, then the
- *    process-context files (/proc/<own-pid>/attr/...), then overlay
- *    files; everything else answers with its real backing label;
+ *  - getxattr/lgetxattr, and the fd spellings fgetxattr/flistxattr:
+ *    replay a stored chcon label first, then the process-context files
+ *    (/proc/<own-pid>/attr/...), then overlay files; everything else
+ *    answers with its real backing label;
  *  - listxattr: every labeled file carries security.selinux;
  *  - getselfattr (raw 416, used by getcon()/id on modern bionic).
+ *
+ * The fd forms were missing here and that leaked: bionic resolves a path
+ * to a descriptor and then queries the descriptor, so `getfattr`, and any
+ * libselinux or sepolicy consumer that opens first and asks second, saw
+ * the real label while the path form saw ours.
  *
  * The real syscall is replaced with the avoider and the answer is forged.
  * sysexit_pending is set so that a second hand (translate_syscall_exit) can
@@ -863,7 +1173,8 @@ static bool afakesu_forge_xattr(Tracee *tracee, word_t syscall_number)
 
 	if (raw != 416
 	 && syscall_number != PR_getxattr && syscall_number != PR_lgetxattr
-	 && syscall_number != PR_listxattr && syscall_number != PR_llistxattr)
+	 && syscall_number != PR_listxattr && syscall_number != PR_llistxattr
+	 && syscall_number != PR_fgetxattr && syscall_number != PR_flistxattr)
 		return false;
 
 	if (getenv("THJ_PDBG"))
@@ -885,7 +1196,16 @@ static bool afakesu_forge_xattr(Tracee *tracee, word_t syscall_number)
 		goto answer;
 	}
 
-	if (get_sysarg_path(tracee, path, SYSARG_1) < 0)
+	/* The fd forms number their value/size arguments exactly where the path
+	 * forms do -- the descriptor simply takes the path's slot -- so once the
+	 * descriptor is turned back into a guest path the rest of this function
+	 * is the same code either way. */
+	if (afakesu_xattr_is_fd(syscall_number)) {
+		if (!afakesu_fd_to_guest(tracee,
+					(int) peek_reg(tracee, ORIGINAL, SYSARG_1),
+					path, sizeof(path)))
+			return false;
+	} else if (get_sysarg_path(tracee, path, SYSARG_1) < 0)
 		return false;
 
 	/* A stored chcon/restorecon label has top priority. */
@@ -905,7 +1225,7 @@ static bool afakesu_forge_xattr(Tracee *tracee, word_t syscall_number)
 		const char *ov = afakesu_ov_path(path, &exists);
 		if (ov == NULL || !exists)
 			return false;
-		if (syscall_number == PR_listxattr || syscall_number == PR_llistxattr) {
+		if (afakesu_xattr_is_list(syscall_number)) {
 			value = "security.selinux";
 			vlen = sizeof("security.selinux");
 			buf = peek_reg(tracee, ORIGINAL, SYSARG_2);
@@ -923,7 +1243,7 @@ static bool afakesu_forge_xattr(Tracee *tracee, word_t syscall_number)
 	}
 
 	/* listxattr/llistxattr: our files carry security.selinux. */
-	if (syscall_number == PR_listxattr || syscall_number == PR_llistxattr) {
+	if (afakesu_xattr_is_list(syscall_number)) {
 		value = "security.selinux";
 		vlen = sizeof("security.selinux"); /* includes NUL */
 		buf = peek_reg(tracee, ORIGINAL, SYSARG_2);
@@ -2714,7 +3034,8 @@ int translate_syscall_enter(Tracee *tracee)
 				(unsigned long long) thj_raw, (int) syscall_number, thj_buf);
 		}
 	}
-	if (!afakesu_forge_xattr(tracee, syscall_number)) {
+	if (!afakesu_forge_xattr(tracee, syscall_number)
+	 && !afakesu_forge_capabilities(tracee, syscall_number)) {
 	afakesu_redirect_proc1(tracee, syscall_number);
 	switch (syscall_number) {
 	default:

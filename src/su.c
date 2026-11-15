@@ -11,6 +11,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <sys/prctl.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -21,6 +22,14 @@
 #include <unistd.h>
 #include "proot-termux/src/cli/cli.h"
 #include "proot-termux/src/cli/note.h"
+
+/* Vsud, the privilege anchor.  Implemented in vsud.c and kept separate on
+ * purpose: it is a second, long-lived process whose whole job is to define
+ * where the faked identity begins.  su.c must not grow that responsibility,
+ * or the anchor would inherit the very state it is supposed to sit above. */
+int vsud_daemon_main(void);
+int vsud_client_main(int argc, char **argv);
+#define VSUD_FALLBACK (-1)
 extern const unsigned char _binary_bash_bin_start[];
 extern const unsigned char _binary_bash_bin_end[];
 #define EMBEDDED_BASH_SIZE ((size_t)(_binary_bash_bin_end - _binary_bash_bin_start))
@@ -37,8 +46,11 @@ extern const unsigned char _binary_rish_start[];
 extern const unsigned char _binary_rish_end[];
 extern const unsigned char _binary_rish_shizuku_dex_start[];
 extern const unsigned char _binary_rish_shizuku_dex_end[];
-#define VERSION_STR "3.2.5-44-g0f65ab64:KernelSU"
-#define VERSION_CODE "32569"
+/* Historically these were hardcoded KernelSU 3.2.5 values.  They are kept
+ * as macros so the many use sites stay untouched, but they now forward to
+ * the active persona, which defaults to honest VirtualSU 1.3.0. */
+#define VERSION_STR  g_p_version
+#define VERSION_CODE g_p_code
 #define DEFAULT_SHELL "/system/bin/sh"
 #define ANDROID_PATH "/sbin:/vendor/bin:/system/sbin:/system/bin:/system/xbin"
 /* Guest-visible mirror of <workdir>/bin (the getprop/mount/chcon wrappers).
@@ -88,15 +100,299 @@ static bool g_mount = false;
  * capability for the session, so a capability probe sees an unprivileged
  * root rather than a fully capable one. */
 static bool g_interactive = false;
-/* -W / --no-wrapper and --ksu-no-new-privs are in KSU's su and were missing
- * here.  Both are accepted and both do something, rather than being stubs
- * that only appear in --help. */
-static bool g_no_wrapper = false;
-static bool g_ksu_no_new_privs = false;
+/* -u/--user: the uid to run as, as an alternative to the positional
+ * "su [user]" form.  Both end up in the same place; main() rejects the two
+ * spellings disagreeing rather than picking one. */
+static const char *g_user_opt = NULL;
 /* Not static: proot's enter.c rewrites /proc/<pid>/status on every read and
  * needs the same flag, otherwise --drop-cap changes the file we generate
- * but not the one the session actually reads. */
+ * but not the one the session actually reads.  Superseded by --caps for
+ * anything finer-grained, but still the switch --caps none is defined in
+ * terms of, and still what decides the bounding set. */
 int g_drop_cap = false;
+
+/*
+ * The five capability sets the session presents, in the two-32-bit-word
+ * layout capget(2) version 3 uses.
+ *
+ * Exported, and deliberately so: two places answer "what capabilities does
+ * this session hold" -- su.c's own /proc stand-in for the wrapper, and
+ * enter.c's for everything running under proot.  Each used to re-derive the
+ * answer from `uid == 0 && !g_drop_cap` independently, which is precisely
+ * the duplicated decision that stops agreeing with itself; one of the two
+ * would have been updated and the other not.  There is one answer now and
+ * both read it.
+ *
+ * The default is what uid 0 really has on this kernel: all 38 implemented
+ * bits in permitted/effective, nothing inheritable or ambient, and a full
+ * bounding set.  --caps replaces it with whatever was asked for.
+ */
+struct af_capsets {
+	uint32_t inh[2];
+	uint32_t prm[2];
+	uint32_t eff[2];
+	uint32_t bnd[2];
+	uint32_t amb[2];
+};
+
+struct af_capsets g_caps = {
+	{ 0, 0 },			/* inh: nothing is inheritable */
+	{ 0xffffffffu, 0x3fu },		/* prm: bits 0-37, all this kernel has */
+	{ 0xffffffffu, 0x3fu },		/* eff */
+	{ 0xffffffffu, 0x3fu },		/* bnd */
+	{ 0, 0 },			/* amb */
+};
+
+/* Set when --caps was given, so a non-root uid can still be given a
+ * capability set.  Without it the uid decides, matching setuid(): a uid
+ * that is not 0 comes up with permitted/effective empty whatever the parent
+ * had.  A capability that a real kernel would only obtain from a file or an
+ * ambient set is something the caller has to ask for by name. */
+int g_caps_explicit = false;
+
+/* The capability bits this kernel's headers name.  `all' in a --caps
+ * specification means exactly this set -- the legitimate tags -- rather
+ * than 64 bits of which the top 23 name nothing.  Measured on the target
+ * device, uid 0 holds 0x3fffffffff, i.e. the first 38 of these. */
+struct af_capname {
+	const char *name;
+	int bit;
+};
+
+static const struct af_capname af_cap_names[] = {
+	{ "chown",			0  }, { "dac_override",		1  },
+	{ "dac_read_search",		2  }, { "fowner",		3  },
+	{ "fsetid",			4  }, { "kill",		5  },
+	{ "setgid",			6  }, { "setuid",		7  },
+	{ "setpcap",			8  }, { "linux_immutable",	9  },
+	{ "net_bind_service",		10 }, { "net_broadcast",		11 },
+	{ "net_admin",			12 }, { "net_raw",		13 },
+	{ "ipc_lock",			14 }, { "ipc_owner",		15 },
+	{ "sys_module",			16 }, { "sys_rawio",		17 },
+	{ "sys_chroot",			18 }, { "sys_ptrace",		19 },
+	{ "sys_pacct",			20 }, { "sys_admin",		21 },
+	{ "sys_boot",			22 }, { "sys_nice",		23 },
+	{ "sys_resource",		24 }, { "sys_time",		25 },
+	{ "sys_tty_config",		26 }, { "mknod",		27 },
+	{ "lease",			28 }, { "audit_write",		29 },
+	{ "audit_control",		30 }, { "setfcap",		31 },
+	{ "mac_override",		32 }, { "mac_admin",		33 },
+	{ "syslog",			34 }, { "wake_alarm",		35 },
+	{ "block_suspend",		36 }, { "audit_read",		37 },
+	{ "perfmon",			38 }, { "bpf",		39 },
+	{ "checkpoint_restore",		40 },
+};
+
+/* Highest bit any name above claims; `all' stops here. */
+#define AF_CAP_LAST_NAMED 40
+
+static void af_cap_set(uint32_t w[2], int bit)
+{
+	if (bit < 32)
+		w[0] |= 1u << bit;
+	else if (bit < 64)
+		w[1] |= 1u << (bit - 32);
+}
+
+static void af_cap_clear(uint32_t w[2], int bit)
+{
+	if (bit < 32)
+		w[0] &= ~(1u << bit);
+	else if (bit < 64)
+		w[1] &= ~(1u << (bit - 32));
+}
+
+/* Render the way /proc/<pid>/status does: the high word first, so the
+ * caller and this function cannot disagree about which half is which. */
+static const char *af_caps_hex(const uint32_t w[2], char *buf, size_t cap)
+{
+	snprintf(buf, cap, "%08x%08x", w[1], w[0]);
+	return buf;
+}
+
+static void af_caps_set_bit(int bit)
+{
+	af_cap_set(g_caps.prm, bit);
+	af_cap_set(g_caps.eff, bit);
+	/* Anything asked for by name has to be obtainable, and a real kernel
+	 * only hands out a capability that is inside the bounding set. */
+	af_cap_set(g_caps.bnd, bit);
+}
+
+static int af_cap_lookup(const char *s, size_t len)
+{
+	size_t i;
+
+	if (len > 4 && strncmp(s, "cap_", 4) == 0) {
+		s += 4;
+		len -= 4;
+	}
+	for (i = 0; i < sizeof(af_cap_names) / sizeof(af_cap_names[0]); i++)
+		if (strlen(af_cap_names[i].name) == len
+		 && strncmp(af_cap_names[i].name, s, len) == 0)
+			return af_cap_names[i].bit;
+	return -1;
+}
+
+static void af_cap_invalid(const char *tok, size_t len)
+{
+	char name[64];
+	size_t n = len < sizeof(name) - 1 ? len : sizeof(name) - 1;
+
+	memcpy(name, tok, n);
+	name[n] = '\0';
+	if (len >= sizeof(name))
+		fprintf(stderr, "su: capability name too long\n");
+	else
+		fprintf(stderr, "su: unknown capability `%s'\n", name);
+	fprintf(stderr,
+		"su: names are the kernel's, with or without the cap_ prefix "
+		"(chown, net_raw, sys_admin, ...); a bare number 0-63 also works\n");
+}
+
+/*
+ * Parse a --caps specification into permitted/effective/bounding.
+ *
+ * Grammar, all comma- or space-separated:
+ *   all              every named capability
+ *   none             nothing
+ *   NAME | +NAME     add (NAME may be a bare bit number)
+ *   -NAME            remove
+ * The base is `all' unless the list opens with `none', so "-net_raw" reads
+ * as "everything except net_raw" and "net_admin,net_raw" reads as exactly
+ * those two.  Permitted and effective are set to the result and the
+ * bounding set is widened to cover it, because a capability outside the
+ * bounding set can never be held and asking for one would otherwise
+ * produce a session that contradicts itself.
+ */
+static void parse_caps_spec(const char *spec)
+{
+	struct item { int bit; bool add; };
+	struct item items[128];
+	size_t nitems = 0;
+	char buf[1024];
+	char *save = NULL;
+	char *tok;
+	bool kw_none = false;
+	bool kw_all = false;
+	unsigned int removals = 0;
+	size_t i;
+
+	if (strlen(spec) >= sizeof(buf)) {
+		fprintf(stderr, "su: --caps specification too long\n");
+		exit(2);
+	}
+	strcpy(buf, spec);
+
+	/* Pass one: read the list.  Nothing is applied yet, because whether the
+	 * base is `all' or `none' is only known once the whole list has been
+	 * seen -- `-net_raw,net_raw' has to cancel itself out. */
+	for (tok = strtok_r(buf, ", \t", &save); tok != NULL;
+	     tok = strtok_r(NULL, ", \t", &save)) {
+		char *p = tok;
+		bool add = true;
+		int bit;
+		char *endp = NULL;
+
+		if (*p == '+') {
+			p++;
+		} else if (*p == '-') {
+			add = false;
+			p++;
+		}
+		if (*p == '\0')
+			continue;
+
+		if (strcmp(p, "none") == 0) {
+			kw_none = true;
+			continue;
+		}
+		if (strcmp(p, "all") == 0) {
+			kw_all = true;
+			continue;
+		}
+
+		if (p[0] >= '0' && p[0] <= '9') {
+			long v = strtol(p, &endp, 10);
+
+			if (endp == p || *endp != '\0' || v < 0 || v > 63) {
+				af_cap_invalid(p, strlen(p));
+				exit(2);
+			}
+			bit = (int) v;
+		} else {
+			bit = af_cap_lookup(p, strlen(p));
+			if (bit < 0) {
+				af_cap_invalid(p, strlen(p));
+				exit(2);
+			}
+		}
+		if (nitems >= sizeof(items) / sizeof(items[0])) {
+			fprintf(stderr, "su: too many capabilities in --caps\n");
+			exit(2);
+		}
+		items[nitems].bit = bit;
+		items[nitems].add = add;
+		nitems++;
+		/* A removal only means something against something, so it selects
+		 * the full set as the base.  Without one, a bare list means exactly
+		 * what it names rather than everything plus it: "--caps net_raw"
+		 * has to answer the question it looks like it asks. */
+		if (!add)
+			removals++;
+	}
+
+	/* Pass two: apply. */
+	g_caps.inh[0] = g_caps.inh[1] = 0;
+	g_caps.amb[0] = g_caps.amb[1] = 0;
+	g_caps.prm[0] = g_caps.prm[1] = 0;
+	g_caps.eff[0] = g_caps.eff[1] = 0;
+	g_caps.bnd[0] = g_caps.bnd[1] = 0;
+
+	/* An explicit keyword decides the base outright; otherwise a removal in
+	 * the list implies it, and a list of nothing but additions starts from
+	 * empty.  `all' and `none' in the same list is a contradiction, and
+	 * `all' wins only because it was written first in this ordering -- the
+	 * parser does not try to guess better than that. */
+	if (kw_all || (!kw_none && removals > 0))
+		for (i = 0; i <= AF_CAP_LAST_NAMED; i++)
+			af_caps_set_bit((int) i);
+
+	for (i = 0; i < nitems; i++) {
+		if (items[i].add)
+			af_caps_set_bit(items[i].bit);
+		else {
+			af_cap_clear(g_caps.prm, items[i].bit);
+			af_cap_clear(g_caps.eff, items[i].bit);
+			/* Removing something from the bounding set too is what
+			 * makes "-x" mean the session can never hold x, rather
+			 * than merely not holding it right now. */
+			af_cap_clear(g_caps.bnd, items[i].bit);
+		}
+	}
+
+	/* The bounding set has to contain permitted and effective, or the
+	 * session reports a combination the kernel could never produce. */
+	g_caps.bnd[0] |= g_caps.prm[0] | g_caps.eff[0];
+	g_caps.bnd[1] |= g_caps.prm[1] | g_caps.eff[1];
+
+	g_caps_explicit = true;
+}
+
+/* The empty set, for the branches that report "none of it". */
+static const uint32_t g_caps_zero[2] = { 0, 0 };
+
+/* The single place a capability set becomes the string /proc shows. */
+static const char *capsline(const char *label, const uint32_t w[2],
+			    char *buf, size_t cap)
+{
+	char hex[32];
+
+	af_caps_hex(w, hex, sizeof(hex));
+	snprintf(buf, cap, "%s\t%s\n", label, hex);
+	return buf;
+}
+
 /* Set from -i and consumed by build_and_run_proot(). */
 static bool force_pty = false;
 
@@ -133,8 +429,153 @@ static long g_caller_uid = -1;
 static const char **g_pos = NULL;
 static size_t g_pos_cnt = 0;
 static long g_uid = -1;
+/* Whether the uid gets the persona's capability sets at all.  Root always
+ * does.  A non-root uid does only when --caps asked for a set by name,
+ * since setuid() would otherwise leave permitted and effective empty. */
+static bool af_caps_active(void)
+{
+	return g_uid == 0 || g_caps_explicit;
+}
+
 static long g_gid = -1;
 const char *g_selinux_ctx = NULL;
+/* Set when the caller named a context explicitly (-Z / --context), as opposed
+ * to one derived from the target user.  The distinction decides whether the
+ * per-uid gate applies at all: asking for a specific domain is a claim about
+ * identity that has to be checked against the caller's real one, while the
+ * derived default is simply where the session is going -- no real process
+ * runs in virtu_su, so requiring the caller to already be there would refuse
+ * every run. */
+bool g_ctx_explicit = false;
+
+/* VirtualSU: -Z accepts any syntactically valid context by default, not
+ * just one already in the running policy.  proot never touches real
+ * SELinux enforcement, so rejecting an unknown domain bought no real
+ * safety -- it only blocked the "present any label you want" use case.
+ * Set to 1 (or pass --require-existing-domain) to restore the old
+ * policy-membership check. */
+int g_require_existing_domain = 0;
+
+/* ------------------------------------------------------------------ *
+ * Persona: the identity this binary presents.
+ *
+ * Up to now the name and version were compile-time constants claiming to
+ * be KernelSU 3.2.5, which made the tool lie by default and made every
+ * fidelity question unanswerable ("does it match?") whenever the real
+ * thing was not on hand.  VirtualSU presents itself as VirtualSU and
+ * treats the other identities as opt-in data.
+ *
+ * Everything user-visible funnels through these five strings, so a
+ * persona is a file, not a rebuild:
+ *
+ *   $VIRTUALSU_PERSONA=/path/to/kernelsu.json su -c id
+ *   $VIRTUALSU_PERSONA=... su -v          # 3.2.5-44-g0f65ab64:KernelSU
+ *
+ * Unknown keys are ignored and a malformed file is a warning, never a
+ * hard error: identity presentation should not be able to stop a
+ * session.
+ * ------------------------------------------------------------------ */
+static char g_p_name[64]    = "VirtualSU";
+static char g_p_version[64] = "1.3.0";
+static char g_p_code[32]    = "1300";
+static char g_p_banner[64]  = "VirtualSU";
+static char g_p_usage[64]   = "su";
+/* Not static, unlike the four above: proot's enter.c keeps its own copy of
+ * the root-domain fallback for the case where the session ctx file is
+ * missing, and when that fallback was a literal of its own it drifted --
+ * su.c moved to the persona domain and enter.c kept claiming u:r:ksu:s0,
+ * so the two halves of one binary answered differently.  Declaring it here
+ * is the same reason g_drop_cap is not static. */
+char g_p_domain[128] = "u:r:virtu_su:s0";
+static char g_p_shell[128]  = "";   /* empty = built-in default */
+
+/* Trim leading/trailing space and, if present, one layer of "..." so a
+ * quoted value in a hand-written file behaves the way people expect. */
+static void persona_chomp(char *s)
+{
+	char *b = s;
+	size_t n;
+	while (*b == ' ' || *b == '\t')
+		b++;
+	if (b != s)
+		memmove(s, b, strlen(b) + 1);
+	n = strlen(s);
+	while (n > 0 && (s[n-1] == ' ' || s[n-1] == '\t' || s[n-1] == '\r'
+	                 || s[n-1] == '\n'))
+		s[--n] = '\0';
+	n = strlen(s);
+	if (n >= 2 && s[0] == '"' && s[n-1] == '"') {
+		s[n-1] = '\0';
+		memmove(s, s + 1, n - 1);
+	}
+}
+
+static void persona_set(char *dst, size_t cap, const char *val)
+{
+	if (val == NULL)
+		return;
+	snprintf(dst, cap, "%s", val);
+	persona_chomp(dst);
+}
+
+static void persona_apply_kv(const char *k, const char *v)
+{
+	if (strcmp(k, "name") == 0)               persona_set(g_p_name,    sizeof(g_p_name),    v);
+	else if (strcmp(k, "version") == 0)       persona_set(g_p_version, sizeof(g_p_version), v);
+	else if (strcmp(k, "version_code") == 0)  persona_set(g_p_code,    sizeof(g_p_code),    v);
+	else if (strcmp(k, "banner") == 0)        persona_set(g_p_banner,  sizeof(g_p_banner),  v);
+	else if (strcmp(k, "usage_name") == 0)    persona_set(g_p_usage,   sizeof(g_p_usage),   v);
+	else if (strcmp(k, "selinux_domain") == 0) persona_set(g_p_domain, sizeof(g_p_domain), v);
+	else if (strcmp(k, "require_existing_domain") == 0)
+		g_require_existing_domain = (v != NULL && (*v == '1' || *v == 't'
+		                             || *v == 'y' || *v == 'T' || *v == 'Y'));
+	else if (strcmp(k, "shell_path") == 0)    persona_set(g_p_shell,   sizeof(g_p_shell),   v);
+}
+
+/* Minimal JSON reader: finds "key" at the top level, then copies the
+ * following string or bare scalar.  Not a general parser -- a persona file
+ * is a flat object, and pretending otherwise would be a bug factory. */
+static void persona_apply_file(const char *path)
+{
+	FILE *f = fopen(path, "r");
+	char line[512];
+	if (f == NULL) {
+		fprintf(stderr, "su: persona file %s not readable; using built-in identity\n", path);
+		return;
+	}
+	while (fgets(line, sizeof(line), f) != NULL) {
+		char key[64], val[256], *p = line, *k, *v;
+		while (*p == ' ' || *p == '\t')
+			p++;
+		if (*p == '{' || *p == '}' || *p == ',' || *p == '\n' || *p == '\0')
+			continue;
+		k = p;
+		while (*p && *p != ':' && *p != '\n')
+			p++;
+		if (*p != ':')
+			continue;
+		*p++ = '\0';
+		v = p;
+		while (*p && *p != ',' && *p != '\n' && *p != '}')
+			p++;
+		*p = '\0';
+		persona_chomp(k);
+		persona_chomp(v);
+		snprintf(key, sizeof(key), "%s", k);
+		snprintf(val, sizeof(val), "%s", v);
+		persona_apply_kv(key, val);
+	}
+	fclose(f);
+}
+
+static void persona_load(void)
+{
+	const char *p = getenv("VIRTUALSU_PERSONA");
+	if (p != NULL && p[0] != '\0')
+		persona_apply_file(p);
+}
+
+
 
 static bool valid_uint_str(const char *s, long *out);
 static const char *aid_name_for_uid(long uid, char *name, size_t namesz);
@@ -318,39 +759,69 @@ static void emit_chcon_wrappers(const char *ctx_path)
 
 static void print_help(FILE *f)
 {
-	/* Transcribed from the real ksud, run as argv[0]="su":
-	 *   exec -a su ksud.bin --help
-	 * verified byte-for-byte with diff.  Options KSU does not have are not
-	 * offered here, and the two it does and this did not are: -W/--no-wrapper
-	 * and --ksu-no-new-privs.  The paragraph this used to end with, saying
-	 * -t and -mm cannot really work because a fake root is unprivileged,
-	 * is gone: a real su does not narrate its own limits, and that text
-	 * identified the binary as an imitation more plainly than any banner. */
+	/* Written for this tool, not transcribed.  It used to be ksud's help
+	 * copied byte-for-byte and then appended to, which was the wrong way
+	 * round: the copy is what made the binary an imitation, and it made the
+	 * additions dishonest, because -Z/-t/-i/-d/-m are ours and the real
+	 * ksud has none of them (checked: exec -a su ksud.bin --help).  Two
+	 * entries were worse than cosmetic -- -W/--no-wrapper and
+	 * --ksu-no-new-privs were named after another project's internals,
+	 * were accepted by the parser, and then read nowhere, so the help
+	 * promised a behaviour that did not exist.  Both are gone rather than
+	 * documented, since there is no code behind them to keep honest. */
 	fprintf(f,
-		"KernelSU\n"
+		"%s\n"
 		"\n"
-		"Usage: su [options] [-] [user [argument...]]\n"
+		"Virtual root environment. Runs a command as an unprivileged user\n"
+		"whose view of the system -- filesystem, uid, groups, properties,\n"
+		"SELinux labels -- is supplied by this process.\n"
+		"\n"
+		"This is not a root implementation and does not bypass the kernel.\n"
+		"SELinux enforcement, DAC checks and the real uid of the process are\n"
+		"unchanged: everything below is what the command is *told*, made\n"
+		"consistent so that scripts depending on it work. Point trusted code\n"
+		"at it and you get a sandbox, not a root.\n"
+		"\n"
+		"Usage: %s [options] [-] [user [argument...]]\n"
 		"\n"
 		"Options:\n"
 		"    -c, --command COMMAND\n"
 		"                        pass COMMAND to the invoked shell\n"
 		"    -h, --help          display this help message and exit\n"
 		"    -l, --login         pretend the shell to be a login shell\n"
-		"    -p, --preserve-environment \n"
+		"    -p, --preserve-environment\n"
 		"                        preserve the entire environment\n"
 		"    -s, --shell SHELL   use SHELL instead of the default /system/bin/sh\n"
 		"    -v, --version       display version number and exit\n"
 		"    -V                  display version code and exit\n"
 		"    -M, --mount-master  force run in the global mount namespace\n"
+		"    -m, -mm            same as -M\n"
 		"    -g, --group GROUP   Specify the primary group\n"
 		"    -G, --supp-group GROUP\n"
 		"                        Specify a supplementary group. The first specified\n"
 		"                        supplementary group is also used as a primary group if\n"
 		"                        the option -g is not specified.\n"
-		"    -W, --no-wrapper    don't use ksu fd wrapper\n"
-		"        --ksu-no-new-privs \n"
-		"                        Prevent this process (and its children) from privilege\n"
-		"                        re-escalation via KernelSU\n");
+		"    -u, --user UID      run as UID\n"
+		"    -t, --target PID    run in the mount namespace of PID\n"
+		"    -Z CONTEXT         set the reported SELinux context (any valid context)\n"
+		"    -i, --interactive  force prompt on the calling uid\n"
+		"    -d, --drop-cap      drop every capability, including the\n"
+		"                        bounding set\n"
+		"    -C, --caps SPEC     which capabilities the session holds:\n"
+		"                          all | none | NAME[,NAME...]\n"
+		"                          -NAME removes from the full set\n"
+		"                          NAME may be a kernel capability name\n"
+		"                          (with or without cap_) or a number 0-63\n"
+		"                        Permitted and effective become exactly SPEC\n"
+		"                        and the bounding set is widened to cover\n"
+		"                        it.  A bare list means exactly what it names;\n"
+		"                        a `-NAME' anywhere means the full set minus\n"
+		"                        those.  Default: what uid 0 really has here.\n"
+		"        --require-existing-domain\n"
+		"                        reject -Z contexts absent from the running policy\n"
+		"                        (off by default; the policy is not consulted\n"
+		"                        otherwise, so any well-formed context is accepted)\n",
+		g_p_banner, g_p_usage);
 }
 static void usage_err(const char *fmt, ...)
 {
@@ -549,10 +1020,26 @@ static const char *const SELINUX_KNOWN_EXTRA_CTX[] = {
 	"u:r:untrusted_app:s0", "u:r:platform_app:s0", "u:r:priv_app:s0",
 	"u:r:isolated_app:s0", "u:r:su:s0", "u:r:ksu:s0",
 };
-static void selinux_ctx_reject(const char *in)
+/* Two distinct failures, and they used to share one message: a caller
+ * passing a syntactically broken context was told the domain "does not
+ * exist on this device", which is both untrue and sends you off debugging
+ * the wrong thing.  Malformed is a typo; unknown is only rejected when
+ * --require-existing-domain is in effect. */
+static void selinux_ctx_reject_malformed(const char *in, const char *why)
 {
 	fprintf(stderr,
-		"su: security context `%s' names a domain that does not exist on this device; refusing\n",
+		"su: invalid security context `%s': %s\n"
+		"su: expected user:role:type:sensitivity[:categories], e.g. u:r:init:s0\n",
+		in, why);
+	exit(1);
+}
+
+static void selinux_ctx_reject_unknown(const char *in)
+{
+	fprintf(stderr,
+		"su: security context `%s' names a domain that does not exist on this device\n"
+		"su: pass --require-existing-domain only if you want that enforced; "
+		"by default any valid context is accepted\n",
 		in);
 	exit(1);
 }
@@ -692,14 +1179,38 @@ static void uid_doms_load(void)
  * final, next to where the default context is chosen. */
 static void selinux_ctx_gate_uid(const char *ctx)
 {
-	if (g_uid < 0 || ctx == NULL || ctx[0] == '\0')
+	/* Only an explicitly requested context is gated.
+	 *
+	 * The gate answers "may this caller claim this domain?", which is a
+	 * meaningful question for -Z: a process running in untrusted_app_27 has
+	 * no business asking to be magisk.  It is NOT a meaningful question for
+	 * the derived default.  virtu_su is our own fiction -- no real process
+	 * on this device holds it, uid 0 included -- so demanding the caller
+	 * already run there refuses literally every session, which is how rish
+	 * ended up broken while Termux worked.
+	 *
+	 * What made the two entry points disagree was not the gate but what it
+	 * was given: g_uid is the session's *target* (root), identical on both
+	 * paths, so the subject has to be the caller's real uid.  Termux starts
+	 * at an app uid that does appear in the table, which is why the
+	 * have_uid escape hatch hid the problem there. */
+	/* Off by default.  A real su never asks the caller's running
+	 * processes which domains it is allowed to wear -- it setcon()s and
+	 * lets the policy decide -- so refusing -Z here only told the caller
+	 * what the host really runs.  Any well-formed context is accepted,
+	 * existing or not; --require-existing-domain restores the strict
+	 * check for anyone who wants it. */
+	if (!g_require_existing_domain || !g_ctx_explicit)
+		return;
+	long who = (g_caller_uid >= 0) ? g_caller_uid : g_uid;
+	if (who < 0 || ctx == NULL || ctx[0] == '\0')
 		return;
 	uid_doms_load();
 	char dom[64];
 	selinux_ctx_domain(ctx, dom, sizeof(dom));
 	bool have_uid = false, ok = false;
 	for (int i = 0; i < g_uid_doms_n; i++)
-		if (g_uid_doms[i].uid == g_uid) {
+		if (g_uid_doms[i].uid == who) {
 			have_uid = true;
 			if (strcmp(g_uid_doms[i].dom, dom) == 0) {
 				ok = true;
@@ -708,13 +1219,52 @@ static void selinux_ctx_gate_uid(const char *ctx)
 		}
 	if (!have_uid || ok)
 		return;
-	fprintf(stderr, "su: uid %ld does not run in `%s'; refusing\n", g_uid, dom);
-	fprintf(stderr, "su: uid %ld runs in", g_uid);
-	for (int i = 0; i < g_uid_doms_n; i++)
-		if (g_uid_doms[i].uid == g_uid)
-			fprintf(stderr, " %s", g_uid_doms[i].dom);
-	fprintf(stderr, "\n");
+	/* Name the mismatch and nothing else.  The old message followed up with
+	 * the full list of real domains for that uid -- init, vendor_init, vold,
+	 * zygote, ... -- on the stderr of a command whose entire purpose is not
+	 * to publish host state. */
+	fprintf(stderr, "su: refusing: caller uid %ld does not run in `%s'\n", who, dom);
 	exit(1);
+}
+
+/* A context must be well-formed "u:r:<type>:s0[:c<N>[,c<N>]...]".  -Z is
+ * a claim about what the session wears, not a lookup, so the type is never
+ * checked against the device policy: a domain this device does not define
+ * is still accepted.  Only the shape is enforced, so a bare token (F), a
+ * truncated label (u:r:x) or stray separators are refused before they can
+ * reach the ctx file. */
+static bool selinux_ctx_syntax_ok(const char *ctx)
+{
+	const char *p;
+	if (strncmp(ctx, "u:r:", 4) != 0)
+		return false;
+	p = ctx + 4;
+	if (!(isalnum((unsigned char)*p) || *p == '_'))
+		return false;
+	while (isalnum((unsigned char)*p) || *p == '_')
+		p++;
+	if (strncmp(p, ":s0", 3) != 0)
+		return false;
+	p += 3;
+	if (*p == '\0')
+		return true;
+	if (*p != ':')
+		return false;
+	p++;
+	for (;;) {
+		if (*p != 'c')
+			return false;
+		p++;
+		if (!isdigit((unsigned char)*p))
+			return false;
+		while (isdigit((unsigned char)*p))
+			p++;
+		if (*p == '\0')
+			return true;
+		if (*p != ',')
+			return false;
+		p++;
+	}
 }
 
 static const char *selinux_ctx_norm_validate(const char *in)
@@ -722,10 +1272,8 @@ static const char *selinux_ctx_norm_validate(const char *in)
 	static char norm[128];
 	const char *ctx = in;
 	size_t i;
-	if (in == NULL || in[0] == '\0') {
-		fprintf(stderr, "su: empty security context\n");
-		exit(1);
-	}
+	if (in == NULL || in[0] == '\0')
+		selinux_ctx_reject_malformed("", "empty value");
 	if (strncmp(in, "u:r:", 4) != 0) {
 		for (i = 0; i < sizeof(AID_SELINUX_CTX)/sizeof(AID_SELINUX_CTX[0]); i++)
 			if (strcmp(AID_SELINUX_CTX[i].user, in) == 0) {
@@ -733,25 +1281,26 @@ static const char *selinux_ctx_norm_validate(const char *in)
 				break;
 			}
 		if (strncmp(ctx, "u:r:", 4) != 0) {
-			/* a bare domain name: only usable if it maps to a known ctx */
-			static char bare[128];
-			if (snprintf(bare, sizeof(bare), "u:r:%s:s0", in) >= (int)sizeof(bare))
-				selinux_ctx_reject(in);
-			if (!selinux_ctx_known(bare))
-				selinux_ctx_reject(in);
-			ctx = bare;
+			/* A bare token is only shorthand for a known AID user
+			 * (shell, radio, ...).  Anything else has to be written
+			 * in full: "-Z F" is not a context. */
+			selinux_ctx_reject_malformed(in,
+				"expected a full context, e.g. u:r:shell:s0");
 		}
 	}
 	for (i = 0; ctx[i] != '\0'; i++) {
 		char c = ctx[i];
 		if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
 		      || (c >= '0' && c <= '9') || c == '_' || c == ':' || c == ','))
-			selinux_ctx_reject(in);
+			selinux_ctx_reject_malformed(in, "allowed characters are A-Z a-z 0-9 _ : ,");
 		if (i >= sizeof(norm) - 2)
-			selinux_ctx_reject(in);
+			selinux_ctx_reject_malformed(in, "too long");
 	}
-	if (!selinux_ctx_known(ctx))
-		selinux_ctx_reject(in);
+	if (!selinux_ctx_syntax_ok(ctx))
+		selinux_ctx_reject_malformed(in,
+			"expected u:r:<type>:s0[:categories], e.g. u:r:init:s0");
+	if (g_require_existing_domain && !selinux_ctx_known(ctx))
+		selinux_ctx_reject_unknown(in);
 	snprintf(norm, sizeof(norm), "%s", ctx);
 	return norm;
 }
@@ -1603,17 +2152,20 @@ static const char *selinux_ctx_for_user(const char *user)
 		if (valid_uint_str(name, &u) && aid_name_for_uid(u, namebuf, sizeof(namebuf)))
 			name = namebuf;
 	}
-	/* KernelSU is the reference here, and its root sessions run in
-	 * u:r:ksu:s0 -- that string is hardcoded in ksud itself.  Note this
-	 * is NOT the u:r:su:s0 constant that appears in KernelSU's Natives.kt:
-	 * that one is only the *default value an App Profile starts from*, not
-	 * the domain a real su session lands in.  Getting this wrong is exactly
-	 * the kind of tell we are trying to avoid, since u:r:su:s0 is the old
-	 * Magisk domain and reads as "old Magisk" rather than "KernelSU".
-	 * kernel:s0 would be worse still -- that is init's domain, shared with
-	 * the rest of uid 0's 24 observed domains. */
+	/* The root domain is the persona's, not a constant.  It used to be the
+	 * literal "u:r:ksu:s0", so the default identity claimed KernelSU while
+	 * the banner said VirtualSU -- the binary contradicted itself on the
+	 * very first question anyone asks it.  g_p_domain defaults to
+	 * u:r:virtu_su:s0 and personas/kernelsu.json is what puts
+	 * u:r:ksu:s0 back, as opt-in data.
+	 *
+	 * Kept in the record because both alternatives were wrong for
+	 * different reasons: u:r:su:s0 is only the *default value an App
+	 * Profile starts from* in KernelSU's Natives.kt, not the domain a
+	 * real su session lands in, and u:r:kernel:s0 is init's own domain,
+	 * shared with the other 23 observed domains of uid 0. */
 	if (name == NULL || name[0] == '\0' || strcmp(name, "root") == 0)
-		return "u:r:ksu:s0";
+		return g_p_domain;
 	if (strcmp(name, "shell") == 0)
 		return "u:r:shell:s0";
 
@@ -1660,6 +2212,56 @@ static const char *selinux_ctx_for_user(const char *user)
 		if (strcmp(AID_SELINUX_CTX[i].user, name) == 0)
 			return AID_SELINUX_CTX[i].ctx;
 	return "u:r:shell:s0";
+}
+/* App domains are never worn bare on a real device: seapp_contexts gives
+ * untrusted_app* levelFrom=all and platform_app levelFrom=user, so
+ * "u:r:untrusted_app_30:s0" with no categories is a label this device
+ * cannot actually produce.  An explicit -Z that names one of those domains
+ * but omits the categories is completed here instead of being left as a
+ * give-away.  Categories come from the session's target uid, the same
+ * computation the default path uses; an app-uid target is what an app
+ * domain implies, and when the target is root the caller's own app id is
+ * the next best thing. */
+static const char *selinux_ctx_ensure_mcs(const char *ctx)
+{
+	static char buf[192];
+	char dom[64];
+	const char *p;
+	size_t n;
+	if (ctx == NULL || strstr(ctx, ":s0:c") != NULL)
+		return ctx;
+	if (strncmp(ctx, "u:r:", 4) != 0)
+		return ctx;
+	p = ctx + 4;
+	n = 0;
+	while (p[n] != '\0' && p[n] != ':' && n < sizeof(dom) - 1) {
+		dom[n] = p[n];
+		n++;
+	}
+	dom[n] = '\0';
+	if (strncmp(dom, "untrusted_app", 13) == 0) {
+		long app_id = g_uid;
+		if (app_id < 10000 && g_caller_uid >= 10000)
+			app_id = g_caller_uid;
+		if (app_id >= 10000) {
+			char mcs[128];
+			mcs_for_app_id(app_id % 100000, mcs, sizeof(mcs));
+			snprintf(buf, sizeof(buf), "%s%s", ctx, mcs);
+		} else {
+			/* No app uid to derive the per-app pair from (a
+			 * root/shell target).  A context without any
+			 * categories is still a label this device never
+			 * wears, so fall back to the shared pair rather than
+			 * leaving it bare. */
+			snprintf(buf, sizeof(buf), "%s:c512,c768", ctx);
+		}
+		return buf;
+	}
+	if (strcmp(dom, "platform_app") == 0) {
+		snprintf(buf, sizeof(buf), "%s:c512,c768", ctx);
+		return buf;
+	}
+	return ctx;
 }
 static bool valid_uint_str(const char *s, long *out)
 {
@@ -2891,6 +3493,7 @@ static void gen_fake_status(void)
 	while (fgets(line, sizeof(line), f)) {
 		const char *repl = NULL;
 		char uidbuf[64], gidbuf[64], grpbuf[512];
+		char capbuf[64];
 		if      (strncmp(line, "Name:", 5) == 0) {
 			char nb[64];
 			snprintf(nb, sizeof(nb), "Name:\t%s\n", g_fake_name);
@@ -2920,36 +3523,39 @@ static void gen_fake_status(void)
 			char tmp[512];
 			snprintf(tmp, sizeof(tmp), "Context:\t%s\n", ctx);
 			repl = tmp;
-		} else if (strncmp(line, "CapInh:", 7) == 0)
-			repl = "CapInh:\t0000000000000000\n";
-		/* The capability sets are per-uid, not a root-or-nothing switch.
-		 * Measured on this device: uid 0 has all 38 bits this kernel
-		 * implements (0x3fffffffff); a non-root shell has CapPrm/CapEff 0
-		 * but a non-empty CapBnd, because setuid() clears the first two
-		 * and leaves the bounding set inherited from the root parent
-		 * alone; and system_server runs with a rich CapEff of its own
-		 * (0x1806897c20) that has nothing to do with being root. */
+		}
+		/* All five sets are read from g_caps, which --caps writes and
+		 * enter.c reads.  They used to be re-derived here from
+		 * `uid == 0 && !g_drop_cap`, and enter.c carried its own copy of
+		 * that expression: the wrapper's /proc stand-in and the session's
+		 * could be made to disagree, and neither could express anything
+		 * finer than all-or-nothing.  The defaults still follow the uid --
+		 * measured on this device uid 0 has all 38 implemented bits
+		 * (0x3fffffffff), while a non-root shell comes up with CapPrm and
+		 * CapEff 0 but keeps a full CapBnd, because setuid() clears the
+		 * first two and leaves the bounding set inherited from the root
+		 * parent alone -- unless --caps named a set, which is the only
+		 * way a non-root uid holds a capability in a session here. */
+		else if (strncmp(line, "CapInh:", 7) == 0)
+			repl = capsline("CapInh:", g_caps.inh, capbuf, sizeof(capbuf));
 		else if (strncmp(line, "CapPrm:", 7) == 0)
-			repl = g_uid == 0 && !g_drop_cap
-				? "CapPrm:\t0000003fffffffff\n"
-				: "CapPrm:\t0000000000000000\n";
+			repl = capsline("CapPrm:", af_caps_active() ? g_caps.prm : g_caps_zero,
+					capbuf, sizeof(capbuf));
 		else if (strncmp(line, "CapEff:", 7) == 0)
-			repl = g_uid == 0 && !g_drop_cap
-				? "CapEff:\t0000003fffffffff\n"
-				: "CapEff:\t0000000000000000\n";
+			repl = capsline("CapEff:", af_caps_active() ? g_caps.eff : g_caps_zero,
+					capbuf, sizeof(capbuf));
 		else if (strncmp(line, "CapBnd:", 7) == 0)
 			/* setuid() does not touch the bounding set; only
-			 * prctl(PR_CAPBSET_DROP) and capset() shrink it.  A real
-			 * su session is forked from a root parent, so every
-			 * persona in it inherits the full bounding set even
-			 * after dropping to a non-zero uid.  Reporting an empty
-			 * CapBnd for `su shell` would be the giveaway, since
-			 * CapPrm/CapEff are 0 there but CapBnd is not. */
-			repl = g_drop_cap
-				? "CapBnd:\t0000000000000000\n"
-				: "CapBnd:\t0000003fffffffff\n";
+			 * prctl(PR_CAPBSET_DROP) and capset() shrink it, so a real
+			 * su session inherits the full set even after dropping to a
+			 * non-zero uid.  Reporting an empty CapBnd for `su shell'
+			 * would contradict CapPrm/CapEff being 0 there.  --drop-cap
+			 * is the one thing that empties it, which is what it is for. */
+			repl = capsline("CapBnd:", g_drop_cap ? g_caps_zero : g_caps.bnd,
+					capbuf, sizeof(capbuf));
 		else if (strncmp(line, "CapAmb:", 7) == 0)
-			repl = "CapAmb:\t0000000000000000\n";
+			repl = capsline("CapAmb:", af_caps_active() ? g_caps.amb : g_caps_zero,
+					capbuf, sizeof(capbuf));
 		/* PRoot runs its tracee with NoNewPrivs=1 and a seccomp filter
 		 * installed, while a real root shell inherited from a root
 		 * parent has neither.  Leaving the supervisor's values in place
@@ -3035,6 +3641,52 @@ static void rm_rf(const char *path)
  * wrappers pure pass-through relays of the device, which is correct but
  * offers no place for a fake model/serial/... to stick.
  */
+/* Read one key back out of the harvested property set (written by
+ * gen_fake_props).  Used to seed the session environment with values that
+ * must match what getprop reports. */
+static bool fake_prop_lookup(const char *key, char *out, size_t outsz)
+{
+	char path[PATH_MAX];
+	FILE *f;
+	size_t klen = strlen(key);
+	char line[1024];
+	bool found = false;
+
+	snprintf(path, sizeof(path), "%s/.props", g_work_dir);
+	f = fopen(path, "r");
+	if (f == NULL)
+		return false;
+	while (fgets(line, sizeof(line), f) != NULL) {
+		if (strncmp(line, key, klen) == 0 && line[klen] == '=') {
+			char *v = line + klen + 1;
+			v[strcspn(v, "\n")] = '\0';
+			snprintf(out, outsz, "%s", v);
+			found = true;
+			break;
+		}
+	}
+	fclose(f);
+	return found;
+}
+
+/* The prompt is "$HOSTNAME:$PWD"; an empty HOSTNAME renders as ":/ #", which
+ * is not what a real device shell shows.  Derive it from the device the same
+ * way init does, so it tracks the hardware instead of a hard-coded name. */
+static const char *device_hostname(char *buf, size_t n)
+{
+	static const char *keys[] = {
+		"ro.product.device", "ro.product.model", "net.hostname"
+	};
+	size_t i;
+
+	for (i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
+		if (fake_prop_lookup(keys[i], buf, n) && buf[0] != '\0')
+			return buf;
+	}
+	snprintf(buf, n, "localhost");
+	return buf;
+}
+
 static void gen_fake_props(void)
 {
 	char path[PATH_MAX];
@@ -3270,6 +3922,100 @@ static void cleanup_workdir(void)
 		rm_rf(buf);
 	}
 	closedir(d);
+}
+
+/* Run proot in a child of our own, so that our own death takes the guest
+ * down with it.
+ *
+ * proot arms atexit(kill_all_tracees), which covers every orderly exit.  It
+ * does not cover SIGKILL: atexit handlers never run, the kernel detaches the
+ * ptraced tracees, re-parents them to init, and they sit there blocked
+ * forever -- a guest `sh` still waiting on a pipe whose reader is gone, each
+ * one holding a zombie child that nobody reaps.  Setting PR_SET_PDEATHSIG on
+ * the root tracee covers a single-process guest, but the kernel clears
+ * PDEATHSIG in the child of a fork(2), so a guest that forks -- any pipeline,
+ * any `sh -c` -- still leaks.
+ *
+ * So su forks, and the child runs proot.  We ask the kernel to signal that
+ * child when we die.  The signal is SIGTERM rather than SIGKILL precisely so
+ * the child is still able to run its own cleanup: proot's event loop already
+ * treats SIGTERM as "kill every tracee".  Nothing here depends on catching a
+ * signal we might not get -- the kernel does the delivery, which is the only
+ * thing that still works when su is killed with SIGKILL and never runs
+ * another instruction.
+ *
+ * Cost: the guest's parent is now the supervisor's pid rather than ours, and
+ * `ps` shows one more `su`.  Both processes keep the name `su`, so nothing
+ * downstream that matches on the command name changes.
+ */
+extern void kill_all_tracees(void);
+
+static void supervisor_reap_and_exit(int signum)
+{
+	kill_all_tracees();
+	_exit(128 + signum);
+}
+
+static int run_proot_supervised(int argc, char *const argv[])
+{
+	pid_t expected_parent = getpid();
+	struct sigaction sa;
+	pid_t child;
+	int status;
+
+	child = fork();
+	if (child < 0) {
+		/* No supervisor available.  A bare proot still runs the
+		 * session correctly, it just loses the SIGKILL cleanup, and
+		 * refusing to start would be a worse answer than that. */
+		return proot_main(argc, argv);
+	}
+
+	if (child == 0) {
+		memset(&sa, 0, sizeof(sa));
+		sa.sa_handler = supervisor_reap_and_exit;
+		sigfillset(&sa.sa_mask);
+		/* Deliberately no SA_RESTART: this has work to do. */
+		sigaction(SIGTERM, &sa, NULL);
+
+		prctl(PR_SET_PDEATHSIG, SIGTERM);
+
+		/* If su died between fork(2) and the prctl(2) above, the
+		 * signal has already been missed and never will be.  Being
+		 * re-parented away from su is how we can tell. */
+		if (getppid() != expected_parent)
+			_exit(128 + SIGTERM);
+
+		/* exit(), not _exit(): proot registered kill_all_tracees as
+		 * an atexit handler, and there may still be tracees to kill
+		 * if it is returning early. */
+		exit(proot_main(argc, argv));
+	}
+
+	/* Terminal and job-control signals belong to the guest, not to su.
+	 * ^C is delivered to the whole foreground process group, so every
+	 * tracee already receives it.  Were su to die here instead, that
+	 * death would trigger PR_SET_PDEATHSIG and take the entire session
+	 * down on the first ^C. */
+	signal(SIGINT, SIG_IGN);
+	signal(SIGQUIT, SIG_IGN);
+	signal(SIGTSTP, SIG_IGN);
+	signal(SIGTTIN, SIG_IGN);
+	signal(SIGTTOU, SIG_IGN);
+
+	while (waitpid(child, &status, 0) < 0) {
+		if (errno != EINTR)
+			return EXIT_FAILURE;
+	}
+
+	if (WIFSIGNALED(status)) {
+		/* Die the same way the supervisor did, so the caller sees
+		 * the real cause of death rather than a synthesised code. */
+		signal(WTERMSIG(status), SIG_DFL);
+		raise(WTERMSIG(status));
+		_exit(128 + WTERMSIG(status));
+	}
+	return WIFEXITED(status) ? WEXITSTATUS(status) : EXIT_FAILURE;
 }
 
 static void build_and_run_proot(void)
@@ -3509,6 +4255,10 @@ static void build_and_run_proot(void)
 		setenv_str("LOGNAME", u0);
 		setenv_str("USER", u0);
 		setenv_str("SHELL", shell == g_shell ? g_shell : shell_argv0);
+		{
+			char hnbuf[128];
+			setenv_str("HOSTNAME", device_hostname(hnbuf, sizeof(hnbuf)));
+		}
 		setenv_str("ANDROID_BOOTLOGO", "1");
 		setenv_str("ANDROID_ROOT", "/system");
 		setenv_str("ANDROID_DATA", "/data");
@@ -3583,7 +4333,7 @@ static void build_and_run_proot(void)
 			argv[argc++] = ptyline;
 			argv[argc] = NULL;
 			proot_quiet = true;
-			exit(proot_main(argc, (char *const *)argv));
+			exit(run_proot_supervised(argc, (char *const *)argv));
 		}
 	}
 	argv[argc++] = shell;
@@ -3610,11 +4360,19 @@ static void build_and_run_proot(void)
 	}
 	argv[argc] = NULL;
 	proot_quiet = true;
-	exit(proot_main(argc, (char *const *)argv));
+	exit(run_proot_supervised(argc, (char *const *)argv));
 }
 static void parse_user_and_groups(const char *user)
 {
 	long uid = 0, gid = 0;
+	/* No explicit target means root: that is su's contract, and it holds on
+	 * both entry points.  What differs is the *starting* identity -- Termux
+	 * runs as an app uid, rish as 2000 (shell) -- and that is
+	 * g_caller_uid's job, not this function's.
+	 *
+	 * Getting this confused is what broke rish: the session was told it
+	 * began at uid 0, so the per-uid SELinux gate checked uid 0 against
+	 * virtu_su and refused the run. */
 	if (user == NULL || user[0] == '\0' || strcmp(user, "root") == 0) {
 		uid = 0;
 		gid = 0;
@@ -3740,14 +4498,16 @@ static void parse_options(int argc, char **argv)
 					g_grp = val;
 				else if (strcmp(name, "supp-group") == 0)
 					g_suppg[g_suppg_cnt++] = val;
-				else if (strcmp(name, "context") == 0)
+				else if (strcmp(name, "context") == 0) {
 					g_selinux_ctx = selinux_ctx_norm_validate(val);
-				else if (strcmp(name, "no-wrapper") == 0)
-					g_no_wrapper = true;
-				else if (strcmp(name, "ksu-no-new-privs") == 0)
-					g_ksu_no_new_privs = true;
+					g_ctx_explicit = true;
+				}
 				else if (strcmp(name, "target") == 0)
 					g_tgt = val;
+				else if (strcmp(name, "user") == 0)
+					g_user_opt = val;
+				else if (strcmp(name, "caps") == 0)
+					parse_caps_spec(val);
 				else if (strcmp(name, "shell") == 0)
 					g_shell = val;
 				else if (strcmp(name, "help") == 0)
@@ -3760,6 +4520,12 @@ static void parse_options(int argc, char **argv)
 					usage_err("su: option `--version' doesn't allow an argument");
 				else if (strcmp(name, "mount-master") == 0)
 					usage_err("su: option `--mount-master' doesn't allow an argument");
+				else if (strcmp(name, "interactive") == 0)
+					usage_err("su: option `--interactive' doesn't allow an argument");
+				else if (strcmp(name, "drop-cap") == 0)
+					usage_err("su: option `--drop-cap' doesn't allow an argument");
+				else if (strcmp(name, "require-existing-domain") == 0)
+					usage_err("su: option `--require-existing-domain' doesn't allow an argument");
 				else
 					usage_err("su: unrecognized option `--%s'", name);
 			} else {
@@ -3783,6 +4549,11 @@ static void parse_options(int argc, char **argv)
 					if (i >= argc)
 						usage_err("su: option `--context' requires an argument");
 					g_selinux_ctx = selinux_ctx_norm_validate(argv[i++]);
+					g_ctx_explicit = true;
+				} else if (strcmp(name, "user") == 0) {
+					if (i >= argc)
+						usage_err("su: option `--user' requires an argument");
+					g_user_opt = argv[i++];
 				} else if (strcmp(name, "target") == 0) {
 					if (i >= argc)
 						usage_err("su: option `--target' requires an argument");
@@ -3800,6 +4571,11 @@ static void parse_options(int argc, char **argv)
 					g_interactive = true;
 				else if (strcmp(name, "drop-cap") == 0)
 					g_drop_cap = true;
+				else if (strcmp(name, "caps") == 0) {
+					if (i >= argc)
+						usage_err("su: option `--caps' requires an argument");
+					parse_caps_spec(argv[i++]);
+				}
 				else if (strcmp(name, "preserve-environment") == 0)
 					g_preserve = true;
 				else if (strcmp(name, "version") == 0) {
@@ -3807,10 +4583,8 @@ static void parse_options(int argc, char **argv)
 					exit(0);
 				} else if (strcmp(name, "mount-master") == 0)
 					g_mount = true;
-				else if (strcmp(name, "no-wrapper") == 0)
-					g_no_wrapper = true;
-				else if (strcmp(name, "ksu-no-new-privs") == 0)
-					g_ksu_no_new_privs = true;
+				else if (strcmp(name, "require-existing-domain") == 0)
+					g_require_existing_domain = true;
 				else
 					usage_err("su: unrecognized option `--%s'", name);
 			}
@@ -3826,6 +4600,7 @@ static void parse_options(int argc, char **argv)
 				if (i >= argc)
 					usage_err("su: option requires an argument -- Z");
 				g_selinux_ctx = selinux_ctx_norm_validate(argv[i++]);
+					g_ctx_explicit = true;
 				continue;
 			}
 			if (strcmp(cluster, "mm") == 0) {
@@ -3871,6 +4646,7 @@ static void parse_options(int argc, char **argv)
 					case 'Z':
 					case 'z':
 						g_selinux_ctx = selinux_ctx_norm_validate(arg);
+						g_ctx_explicit = true;
 						break;
 					case 't':
 						g_tgt = arg;
@@ -3887,8 +4663,28 @@ static void parse_options(int argc, char **argv)
 				case 'l':
 					g_login = true;
 					break;
-				case 'W':
-					g_no_wrapper = true;
+				case 'i':
+					g_interactive = true;
+					break;
+				case 'd':
+					g_drop_cap = true;
+					break;
+				case 'C':
+					if (i >= argc)
+						usage_err("su: option `-C' requires an argument");
+					parse_caps_spec(argv[i++]);
+					break;
+				case 'm':
+					/* -mm was already special-cased before this loop;
+					 * -m is the single-letter form of the same request and
+					 * was missing while -mm worked, so the pair behaved
+					 * differently for no reason. */
+					g_mount = true;
+					break;
+				case 'u':
+					if (i >= argc)
+						usage_err("su: option `-u' requires an argument");
+					g_user_opt = argv[i++];
 					break;
 				case 'p':
 					g_preserve = true;
@@ -3903,8 +4699,6 @@ static void parse_options(int argc, char **argv)
 					g_mount = true;
 					break;
 				default:
-					/* Wording matches KSU, from `exec -a su ksud.bin --nope`:
-				 * "Unrecognized option: 'nope'" then the help. */
 					usage_err("Unrecognized option: '%c'", ch);
 				}
 			}
@@ -3919,7 +4713,35 @@ static void parse_options(int argc, char **argv)
 }
 int main(int argc, char **argv)
 {
+	/* Vsud dispatch has to happen before anything else touches the session:
+	 * "--vsud" is a daemon with no workdir, no persona and no tracee, and
+	 * "--vsud-session" is the daemon re-execing this binary to start a real
+	 * session, so the marker must be gone before any argument parsing or
+	 * policy check looks at argv[1]. */
+	if (argc > 1 && argv[1] != NULL) {
+		if (strcmp(argv[1], "--vsud") == 0)
+			return vsud_daemon_main();
+
+		if (strcmp(argv[1], "--vsud-session") == 0) {
+			/* Drop the marker, then let the normal startup run
+			 * unchanged: the session inherits its identity from Vsud
+			 * being its parent, so nothing here has to guess a uid. */
+			memmove(&argv[1], &argv[2], (size_t)(argc - 2) * sizeof(char *));
+			argv[argc - 1] = NULL;
+			argc--;
+		} else {
+			int rc = vsud_client_main(argc, argv);
+			if (rc != VSUD_FALLBACK)
+				return rc;
+			/* No daemon and none could be started: run the session
+			 * here so a fresh install still works.  It is less
+			 * isolated -- the session's parent is the caller's shell
+			 * -- which is why it is a fallback and not the design. */
+		}
+	}
+
 	atexit(cleanup_workdir);
+	persona_load();
 	/* Registered after cleanup_workdir so it runs first: drop our own
 	 * marker, then let cleanup decide whether anyone else is left. */
 	atexit(sess_unmark);
@@ -3991,7 +4813,6 @@ int main(int argc, char **argv)
 		perror("malloc");
 		return 1;
 	}
-	aid_real_patch();
 
 	/* Policy administration, handled before option parsing so it never
 	 * starts a session:
@@ -4080,6 +4901,17 @@ int main(int argc, char **argv)
 	g_caller_uid = (long)getuid();
 
 	parse_options(argc, argv);
+
+	/* Refresh the uid/gid tables only now that the options are known.
+	 * This used to run first, which meant `su -v` had to finish a bridge
+	 * round-trip before it could answer -- about 17s on a device with
+	 * Shizuku down, for a version string that needs no data at all.  It
+	 * also sat ahead of the --policy-* block, so listing a policy paid the
+	 * same cost.  Nothing between here and the old call site reads
+	 * aid_merged_table(), and parse_options() is what exits early for -v,
+	 * -h and -V, so moving it here costs nothing and makes those instant. */
+	aid_real_patch();
+
 	long v;
 	if (g_grp != NULL && !valid_uint_str(g_grp, &v))
 		invalid_gid(g_grp);
@@ -4090,6 +4922,15 @@ int main(int argc, char **argv)
 	if (g_tgt != NULL && !valid_uint_str(g_tgt, &v))
 		invalid_pid(g_tgt);
 	const char *user = (g_pos_cnt > 0) ? g_pos[0] : NULL;
+	if (g_user_opt != NULL) {
+		/* Both spellings name the same thing; accepting one silently and
+		 * dropping the other is how a caller ends up not knowing which uid
+		 * it asked for. */
+		if (user != NULL && strcmp(user, g_user_opt) != 0)
+			usage_err("su: `-u %s' conflicts with the user argument `%s'",
+				g_user_opt, user);
+		user = g_user_opt;
+	}
 	parse_user_and_groups(user);
 	if (g_uid < 0) {
 		g_uid = 2000;
@@ -4368,6 +5209,7 @@ int main(int argc, char **argv)
 	ensure_current_uid_in_files();
 	if (g_selinux_ctx == NULL)
 		g_selinux_ctx = selinux_ctx_for_user(user);
+	g_selinux_ctx = selinux_ctx_ensure_mcs(g_selinux_ctx);
 	selinux_ctx_gate_uid(g_selinux_ctx);
 	{
 		char ug[PATH_MAX];

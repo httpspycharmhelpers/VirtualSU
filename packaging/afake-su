@@ -1,0 +1,29 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# aFakeSU launcher.
+#
+# Runs the proot-based fake su. Everything it needs sits next to this
+# script, so the package works on a fresh device with no extra paths:
+#
+#   fakesu       the su implementation (proot statically embedded)
+#   rish         Shizuku bridge, only used to harvest real uid/group data
+#   rish_shizuku.dex
+#
+# Shizuku is optional. Without it fakesu falls back to its built-in
+# defaults; with it the session shows the device's real group table.
+set -u
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+FAKESU="$SCRIPT_DIR/fakesu"
+
+if [ ! -x "$FAKESU" ]; then
+  echo "afake-su: $FAKESU is missing; reinstall the afake-su package" >&2
+  exit 1
+fi
+
+if [ "$#" -eq 0 ]; then
+  exec "$FAKESU"
+fi
+
+# Join argv with quoting so a command like -c "a && b" stays one argument.
+printf -v ARGS '%q ' "$@"
+exec "$FAKESU" $ARGS

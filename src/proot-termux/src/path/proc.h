@@ -24,6 +24,8 @@
 #define PROC_H
 
 #include <limits.h>
+#include <stdbool.h>
+#include <sys/types.h>
 
 #include "tracee/tracee.h"
 #include "path/path.h"
@@ -40,5 +42,16 @@ extern Action readlink_proc(const Tracee *tracee, char result[PATH_MAX], const c
 			const char component[NAME_MAX],	Comparison comparison);
 
 extern ssize_t readlink_proc2(const Tracee *tracee, char result[PATH_MAX], const char path[PATH_MAX]);
+
+/* True when @pid belongs to the privileged subtree -- Vsud and everything
+ * below it -- and must therefore report the faked SELinux context and uid.
+ * Implemented in proc.c; this is the single source of truth for that
+ * boundary, so the xattr path (enter.c) and the /proc/<pid>/attr/current
+ * path (proc.c) cannot drift apart. */
+extern bool afakesu_pid_in_session(pid_t pid);
+
+/* True when @path names a /proc/<pid> entry owned by a process outside this
+ * session, so its real owner must not be rewritten to the session uid. */
+extern bool afakesu_proc_dir_foreign(const char *path);
 
 #endif /* PROC_H */

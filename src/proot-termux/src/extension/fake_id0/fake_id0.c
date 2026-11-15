@@ -382,6 +382,13 @@ static FilteredSysnum filtered_sysnums[] = {
 	{ PR_utimensat,		FILTER_SYSEXIT },
 #endif
 	{ PR_capset,		FILTER_SYSEXIT },
+	/* capget is here for the same reason capset is, but on the entry side:
+	 * a syscall missing from this table is not trapped at all, so it runs
+	 * natively and the session sees the app's real, empty capability set
+	 * while /proc/<pid>/status reports a full one.  FILTER_SYSENTER (as
+	 * for getgroups below) hands it to enter.c, which answers it from the
+	 * same source of truth as the status file. */
+	{ PR_capget,		FILTER_SYSENTER },
 	{ PR_chmod,		FILTER_SYSEXIT },
 	{ PR_chown,		FILTER_SYSEXIT },
 	{ PR_chown32,		FILTER_SYSEXIT },
@@ -1173,6 +1180,7 @@ static int handle_sysexit_end(Tracee *tracee, Config *config)
 	case PR_chroot: 
 		return handle_chroot_exit_end(tracee, config, false);
 
+	case PR_getdents:
 	case PR_getsockopt:
 		return handle_getsockopt_exit_end(tracee);
 

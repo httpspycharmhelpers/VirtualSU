@@ -26,9 +26,183 @@
 #include <errno.h>   /* E*, */
 #include <assert.h>  /* assert(3), */
 #include <unistd.h>  /* access(2), */
+#include <fcntl.h>   /* open(2), O_RDONLY */
+#include <sys/types.h> /* pid_t, getpid(2) */
 #include <stdbool.h> /* bool */
 
 #include "path/proc.h"
+
+/* ------------------------------------------------------------------ */
+/* Which pids the fake identity covers                                 */
+/* ------------------------------------------------------------------ */
+/*
+ * The rule, and why it is this rule
+ * ---------------------------------
+ * The session has exactly one privileged ancestor: Vsud.  Everything from
+ * Vsud down -- the worker, the su wrapper, proot, and every tracee -- wears
+ * virtu_su, because on a real rooted device that whole subtree inherits the
+ * daemon's context.  Every other pid on the device keeps its own real label.
+ *
+ * That is not a cosmetic choice.  Forging the entire table (every pid reads
+ * virtu_su) is the giveaway: no genuine root implementation can make an
+ * unrelated app look like it is running inside the root domain, so a
+ * *uniform* table is strictly less believable than a correct boundary.  A
+ * checker comparing the session's view against a known-good rooted device
+ * sees the difference immediately.
+ *
+ * It is also the only version that survives the obvious probe.  The caller
+ * that typed `su` is NOT an ancestor here -- Vsud double-forks and re-parents
+ * to init, so the guest's view of the caller is a sibling subtree.  A caller
+ * that can see that its own process still reads untrusted_app_* from inside
+ * the root shell has learned the whole thing is a trick.
+ *
+ * Implementation: climb from the given pid to init and stop at Vsud.  This
+ * needs no registry and no communication with the daemon, so it keeps working
+ * in the paths where a session is spawned directly (VSUD_NO_DAEMON), where
+ * the wrapper su itself is the top of the tree.
+ */
+
+#define VSUD_COMM "vsud"
+
+/* Read a pid's PPID out of /proc/<pid>/stat.  The comm field can contain
+ * spaces and parentheses, so the scan starts after the *last* ')' rather
+ * than tokenising from the front. */
+static pid_t proc_ppid(pid_t pid)
+{
+	char path[64];
+	char buf[1024];
+	char *p, *end;
+	ssize_t n;
+	int fd;
+	pid_t ppid = 0;
+
+	if (pid <= 0)
+		return 0;
+	snprintf(path, sizeof(path), "/proc/%d/stat", pid);
+	fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
+		return 0;
+	n = read(fd, buf, sizeof(buf) - 1);
+	close(fd);
+	if (n <= 0)
+		return 0;
+	buf[n] = '\0';
+
+	p = strrchr(buf, ')');
+	if (p == NULL)
+		return 0;
+	p++;				/* step past ") " */
+
+	/* After comm come: state ppid pgrp session ...  strtol cannot be used
+	 * on the state field (it is a character), so skip one token, then read
+	 * the numeric one. */
+	while (*p == ' ')
+		p++;
+	if (*p == '\0')
+		return 0;
+	p++;				/* skip the state character */
+	while (*p == ' ')
+		p++;
+	if (*p == '\0')
+		return 0;
+
+	ppid = (pid_t) strtol(p, &end, 10);
+	if (end == p || ppid < 0)
+		return 0;
+	return ppid;
+}
+
+static bool proc_comm_is(pid_t pid, const char *want)
+{
+	char path[64];
+	char comm[64];
+	char *nl;
+	ssize_t n;
+	int fd;
+	bool match;
+
+	snprintf(path, sizeof(path), "/proc/%d/comm", pid);
+	fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
+		return false;
+	n = read(fd, comm, sizeof(comm) - 1);
+	close(fd);
+	if (n <= 0)
+		return false;
+	comm[n] = '\0';
+	nl = strchr(comm, '\n');
+	if (nl != NULL)
+		*nl = '\0';
+	match = (strcmp(comm, want) == 0);
+	return match;
+}
+
+/* True when @pid sits inside the privileged subtree, i.e. at or below this
+ * process.  Walking to init and stopping early on a hit keeps the cost
+ * proportional to the subtree height, and -- more to the point -- it makes
+ * the fallback case (VSUD_NO_DAEMON, no Vsud anywhere) behave correctly
+ * without a second code path: there the climb reaches this very process,
+ * which is the top of the tree in that mode.
+ *
+ * Self always qualifies, since the interception runs inside the subtree by
+ * construction and self is exactly what getcon()/id -Z report. */
+bool afakesu_pid_in_session(pid_t pid)
+{
+	const pid_t self = (pid_t) getpid();
+	bool passed_self = false;
+	int depth;
+
+	if (pid <= 0)
+		return false;
+	if (pid == self)
+		return true;
+
+	for (depth = 0; depth < 64; depth++) {
+		if (proc_comm_is(pid, VSUD_COMM))
+			return true;
+		pid = proc_ppid(pid);
+		if (pid <= 0)
+			break;
+		/* Do NOT stop here.  Reaching self only proves the climb
+		 * entered our own tree; Vsud still sits above it, and stopping
+		 * at that point is what made every guest tracee fall through
+		 * to its real untrusted_app label.  Record it and keep going,
+		 * so the no-daemon fallback (no Vsud anywhere above) still
+		 * returns true via passed_self, while the normal daemon case
+		 * finds the real Vsud further up. */
+		if (pid == self)
+			passed_self = true;
+		if (pid == 1)
+			break;
+	}
+	return passed_self;
+}
+
+/* True when @path names a /proc/<pid> entry that belongs to a process
+ * outside this session.  The owner of /proc/<pid> is that process's real
+ * uid, so the fake_id0 uid rewrite has to leave those entries alone:
+ * faking them made toybox "ps" print the session identity in its USER
+ * column for every process on the device, not just the ones we own.  Only
+ * the privileged subtree is ours to wear. */
+bool afakesu_proc_dir_foreign(const char *path)
+{
+	const char *p;
+	char *end;
+	long pid;
+
+	if (path == NULL || strncmp(path, "/proc/", 6) != 0)
+		return false;
+	p = path + 6;
+	if (*p < '0' || *p > '9')
+		return false;
+	errno = 0;
+	pid = strtol(p, &end, 10);
+	if (errno != 0 || end == p || (*end != '\0' && *end != '/'))
+		return false;
+	if (pid <= 0)
+		return false;
+	return !afakesu_pid_in_session((pid_t) pid);
+}
 #include "tracee/tracee.h"
 #include "path/path.h"
 #include "path/binding.h"
@@ -225,8 +399,19 @@ Action readlink_proc(const Tracee *tracee, char result[PATH_MAX],
 		 * after the AFAKESU hook re-directs every non-link
 		 * component under /proc.  */
 		known_tracee = get_tracee(tracee, pid, false);
-		if (known_tracee != NULL && g_selinux_ctx != NULL && g_selinux_ctx[0] != '\0'
-		    && attr_is_selinux(component)) {
+
+		/* SELinux interception, scoped to the privileged subtree.
+		 * See afakesu_pid_in_session() above: Vsud and everything
+		 * below it read virtu_su, the rest of the device keeps its
+		 * real context.  This is the only thing that closes the label
+		 * leak -- "ps -A -o LABEL" and /proc/<pid>/status do not ask
+		 * for an xattr, they open this file and read the kernel's live
+		 * context, so a tracee-only gate left every ancestor wearing
+		 * untrusted_app_27, while forging the whole table would have
+		 * been just as fake in the other direction. */
+		if (g_selinux_ctx != NULL && g_selinux_ctx[0] != '\0'
+		    && attr_is_selinux(component)
+		    && afakesu_pid_in_session(pid)) {
 			char *slash = strrchr(base, '/');
 			if (slash != NULL && strcmp(slash, "/attr") == 0) {
 				char ctx_path[PATH_MAX];

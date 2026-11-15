@@ -10,6 +10,33 @@
 #include "extension/fake_id0/stat.h"
 #include "extension/fake_id0/helper_functions.h"
 #include "tracee/statx.h"
+#include "path/proc.h"
+
+/* AFAKESU: does this stat() target a /proc/<pid> entry owned by a process
+ * outside the session?  Those entries keep their real uid; only the session
+ * subtree wears the faked one. */
+static bool stat_target_is_foreign_proc(Tracee *tracee, word_t sysnum)
+{
+	char path[PATH_MAX];
+
+	switch (sysnum) {
+	case PR_newfstatat:
+	case PR_fstatat64:
+		if (read_sysarg_path(tracee, path, SYSARG_2, MODIFIED) == 0)
+			return afakesu_proc_dir_foreign(path);
+		break;
+	case PR_stat:
+	case PR_lstat:
+	case PR_stat64:
+	case PR_lstat64:
+		if (read_sysarg_path(tracee, path, SYSARG_1, MODIFIED) == 0)
+			return afakesu_proc_dir_foreign(path);
+		break;
+	default:
+		break;
+	}
+	return false;
+}
 
 #ifndef USERLAND
 int handle_stat_exit_end(Tracee *tracee, Config *config, Reg stat_sysarg) {
@@ -38,12 +65,17 @@ int handle_stat_exit_end(Tracee *tracee, Config *config, Reg stat_sysarg) {
 	if (errno != 0)
 		gid = 0; /* Not fatal.  */
 
+	/* AFAKESU: never rewrite the owner of a foreign /proc/<pid> entry.
+	 * "ps" derives its USER column from that owner, so faking it made
+	 * every process on the device answer to the session identity. */
+	bool foreign = stat_target_is_foreign_proc(tracee, get_sysnum(tracee, ORIGINAL));
+
 	/* Override only if the file is owned by the current user.
 	 * Errors are not fatal here.  */
-	if (uid == getuid())
+	if (uid == getuid() && !foreign)
 		poke_uint32(tracee, address + offsetof_stat_uid(tracee), config->suid);
 
-	if (gid == getgid())
+	if (gid == getgid() && !foreign)
 		poke_uint32(tracee, address + offsetof_stat_gid(tracee), config->sgid);
 
 	return 0;
@@ -161,14 +193,17 @@ int fake_id0_handle_statx_syscall(Tracee *tracee, Config *config, uintptr_t stat
 	(void) tracee;
 	// TODO: USERLAND
 	struct statx_syscall_state *state = (struct statx_syscall_state *) statx_state_raw;
+	/* AFAKESU: same /proc boundary as handle_stat_exit_end -- a foreign
+	 * process's directory keeps its real owner. */
+	bool foreign = afakesu_proc_dir_foreign(state->host_path);
 	if (state->statx_buf.stx_mask & STATX_UID) {
-		if (state->statx_buf.stx_uid == getuid()) {
+		if (state->statx_buf.stx_uid == getuid() && !foreign) {
 			state->statx_buf.stx_uid = config->suid;
 			state->updated_stats = true;
 		}
 	}
 	if (state->statx_buf.stx_mask & STATX_GID) {
-		if (state->statx_buf.stx_gid == getuid()) {
+		if (state->statx_buf.stx_gid == getuid() && !foreign) {
 			state->statx_buf.stx_gid = config->sgid;
 			state->updated_stats = true;
 		}

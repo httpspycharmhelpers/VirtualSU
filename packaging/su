@@ -1,0 +1,9 @@
+#!/system/bin/sh
+# aFakeSU su entry point (matches the name every root-detection script and
+# user muscle memory expects).
+D=/data/data/com.termux/files/usr/bin
+if [ -x "$D/fakesu.elf" ]; then
+  exec "$D/fakesu.elf" "$@"
+fi
+echo "su: fakesu.elf is missing; reinstall the afake-su package" >&2
+exit 1

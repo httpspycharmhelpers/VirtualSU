@@ -1,0 +1,7 @@
+#!/data/data/com.termux/files/usr/bin/bash
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+args=""
+for arg in "$@"; do
+    args="$args '$arg'"
+done
+"$SCRIPT_DIR/rish" -c "/data/data/com.termux/files/usr/bin/fakesu.elf $args "
