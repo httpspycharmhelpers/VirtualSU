@@ -3067,57 +3067,57 @@ static void write_embedded(const char *path, const unsigned char *start, const u
 	}
 	close(fd);
 }
+/* Materialise one shared library in the session lib dir.  The previous
+ * version only ever wrote libncursesw when it was missing, and wrote
+ * libiconv *only* in the branch where libncursesw already existed -- so a
+ * fresh work directory got libncursesw.so.6.5 and no libiconv.so at all.
+ * bash (both the embedded one and a Termux copy) links libiconv, so every
+ * harvest died with "library libiconv.so not found" until the dir was
+ * pre-seeded by some earlier session.  Each library is now ensured on its
+ * own: prefer a copy from the real Termux lib dir, fall back to the blob
+ * embedded in this binary. */
+static void ensure_lib_file(const char *libdir, const char *name,
+		const char *self_lib, const unsigned char *emb_start,
+		const unsigned char *emb_end)
+{
+	char dst[PATH_MAX];
+	snprintf(dst, sizeof(dst), "%s/%s", libdir, name);
+	struct stat st;
+	if (stat(dst, &st) == 0 && st.st_size > 0)
+		return;
+	const char *srcs[2];
+	srcs[0] = self_lib;
+	srcs[1] = "/data/data/com.termux/files/usr/lib";
+	for (int i = 0; i < 2; i++) {
+		char s[PATH_MAX];
+		snprintf(s, sizeof(s), "%s/%s", srcs[i], name);
+		struct stat ss;
+		if (stat(s, &ss) == 0 && ss.st_size > 0) {
+			copy_file(s, dst);
+			if (stat(dst, &st) == 0 && st.st_size > 0)
+				return;
+		}
+	}
+	write_embedded(dst, emb_start, emb_end);
+}
 static void ensure_libs(void)
 {
-	char libdir[PATH_MAX];
+	char libdir[PATH_MAX], self_lib[PATH_MAX];
 	snprintf(libdir, sizeof(libdir), "%s/lib", g_work_dir);
 	mkdir(libdir, 0755);
-	char ncu[PATH_MAX], ncu65[PATH_MAX], ncu_sym[PATH_MAX], iconv_src[PATH_MAX];
-	snprintf(ncu, sizeof(ncu), "%s/libncursesw.so.6", libdir);
+	snprintf(self_lib, sizeof(self_lib), "%s/lib", g_self_dir);
+
+	ensure_lib_file(libdir, "libncursesw.so.6.5", self_lib,
+			_binary_libncursesw_so_6_5_start, _binary_libncursesw_so_6_5_end);
+	ensure_lib_file(libdir, "libiconv.so", self_lib,
+			_binary_libiconv_so_start, _binary_libiconv_so_end);
+
+	char ncu[PATH_MAX], ncu65[PATH_MAX], ncu_sym[PATH_MAX];
 	snprintf(ncu65, sizeof(ncu65), "%s/libncursesw.so.6.5", libdir);
-	snprintf(ncu_sym, sizeof(ncu_sym), "%s/libncursesw.so", libdir);
-	snprintf(iconv_src, sizeof(iconv_src), "%s/libiconv.so", libdir);
-	struct stat st_ncu;
-	if (stat(ncu65, &st_ncu) != 0) {
-		const char *srcs[2];
-		char self_lib[PATH_MAX];
-		snprintf(self_lib, sizeof(self_lib), "%s/lib", g_self_dir);
-		srcs[0] = self_lib;
-		srcs[1] = "/data/data/com.termux/files/usr/lib";
-		for (int i = 0; i < 2; i++) {
-			char s65[PATH_MAX];
-			snprintf(s65, sizeof(s65), "%s/libncursesw.so.6.5", srcs[i]);
-			struct stat st;
-			if (stat(s65, &st) != 0)
-				continue;
-			copy_file(s65, ncu65);
-			char sico[PATH_MAX];
-			snprintf(sico, sizeof(sico), "%s/libiconv.so", srcs[i]);
-			if (stat(sico, &st) == 0)
-				copy_file(sico, iconv_src);
-			break;
-		}
-		if (stat(ncu65, &st_ncu) != 0)
-			write_embedded(ncu65, _binary_libncursesw_so_6_5_start, _binary_libncursesw_so_6_5_end);
-	} else if (stat(iconv_src, &st_ncu) != 0) {
-		const char *srcs[2];
-		char self_lib[PATH_MAX];
-		snprintf(self_lib, sizeof(self_lib), "%s/lib", g_self_dir);
-		srcs[0] = self_lib;
-		srcs[1] = "/data/data/com.termux/files/usr/lib";
-		for (int i = 0; i < 2; i++) {
-			char sico[PATH_MAX];
-			snprintf(sico, sizeof(sico), "%s/libiconv.so", srcs[i]);
-			struct stat st;
-			if (stat(sico, &st) == 0) {
-				copy_file(sico, iconv_src);
-				break;
-			}
-		}
-		if (stat(iconv_src, &st_ncu) != 0)
-			write_embedded(iconv_src, _binary_libiconv_so_start, _binary_libiconv_so_end);
-	}
-	if (stat(ncu65, &st_ncu) == 0) {
+	struct stat st;
+	if (stat(ncu65, &st) == 0) {
+		snprintf(ncu, sizeof(ncu), "%s/libncursesw.so.6", libdir);
+		snprintf(ncu_sym, sizeof(ncu_sym), "%s/libncursesw.so", libdir);
 		unlink(ncu);
 		unlink(ncu_sym);
 		symlink("libncursesw.so.6.5", ncu);

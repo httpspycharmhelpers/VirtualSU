@@ -1,57 +1,123 @@
-## aFakeSU
+# VirtualSU
 
-面向非 root 设备的伪 `su` / 伪 root 环境。基于 proot-termux 的 syscall 拦截与 terhijack 会话上下文,让需要 root 的脚本在本机跑通,同时尽量不给宿主留下 root 痕迹。本质仍是用户态伪造,**骗不过深度检测,仅供娱乐**。
+面向 **非 root 设备** 的虚拟 root 沙箱。它在用户态为一条命令伪造出一份一致、可信的「root 视角」——文件系统、uid/gid、附加组、capability、系统属性、SELinux 标签、`/proc` 视图——让依赖 root 的脚本、检测脚本、安装/打包流程在本机跑通，而**不触碰内核**。
 
-## 能做什么
+它不是 root 实现，也不绕过内核：SELinux 强制、DAC 检查、进程的真实 uid 全部不变。所谓「root」是**告诉命令什么**，并把这些说法拼成一套自洽的叙事。把可信代码指进来，你得到的是一个沙箱，不是提权。
 
-| 能力 | 说明 |
+与 KernelSU / Magisk 的区别：本项目不模仿它们的实现，最大的特点是在 **SELinux / syscall 层做拦截与伪造**，且不隐藏自身。配套的 Vsud 守护进程把每次会话的祖先从调用者 shell 换成 root 身份的守护进程，让「谁在跑 root」这件事在进程树上也成立。
+
+> 产物二进制名为 `fakesu.elf`（本机对任何**名为 `su` 的 ELF** 会拒绝执行，所以 `su` 只能以脚本形式存在）。项目名 / 发布包名统一为 **VirtualSU**。
+
+## 快速开始
+
+两种入口，行为一致：
+
+**Termux（app uid 启动）**
+
+```sh
+~/aFakeSU/src/fakesu.elf -c 'id; id -Z'      # 直接跑
+su -c 'id'                                    # 经包装器（安装 deb 后）
+sudo id                                       # sudo 前端
+```
+
+**rish（uid 2000 / Shizuku）**
+
+```sh
+rish -c "/data/local/tmp/fakesu.elf -c 'id; id -Z'"
+```
+
+两条路径都会自动：从设备真实数据里采集 uid/组/属性/SELinux 策略（经 Shizuku 桥接，失败则退回内置默认值），再为命令搭建会话。
+
+## 命令
+
+### `fakesu.elf`（`su` 的本体）
+
+```
+su [选项] [-] [user [argument...]]
+```
+
+| 选项 | 作用 |
 |------|------|
-| `su -c 'cmd'` | 以 root 身份执行命令(uid/gid=0,workdir 内 `id` 显示 root) |
-| 只读属性改写 | `getprop/setprop/resetprop` 走 workdir 包装器,键值持久化在 `.props` |
-| 分区覆盖写 | `/system`、`/vendor`、`/product`、`/odm`、`/` 的写操作重定向到 `workdir/ov/`,stat 伪装 root:root、真实 mode/size |
-| `mount -o remount,rw` | 接受并记忆 rw/ro 状态,`mount` 输出按需改写 |
-| `chcon` / `restorecon` | 让 `ls -Z` 显示指定标签(存 `.xattrs/`,数量、非覆盖路径查询走真实 xattr) |
-| SELinux 上下文 | `id -Z`→`u:r:shell:s0`/自定义,`ps -Z`/`ls -Z`/`getenforce` 可控 |
+| `-c, --command CMD` | 把 `CMD` 交给会话 shell 执行 |
+| `-l, --login` | 作为登录 shell 启动 |
+| `-s, --shell SH` | 用 `SH` 代替默认 `/system/bin/sh` |
+| `-p, --preserve-environment` | 原样保留环境变量 |
+| `-u, --user UID` | 以指定 UID 运行 |
+| `-g, --group GID` | 指定主组 |
+| `-G, --supp-group GID` | 追加附加组（未给 `-g` 时第一个兼作主组） |
+| `-Z CONTEXT` | 指定上报的 SELinux 上下文（任意语法合法域，`untrusted_app` 等自动补 MLS） |
+| `-C, --caps SPEC` | 会话持有的 capability：`all` / `none` / `NAME[,NAME...]`，`-NAME` 表示从全集里去掉 |
+| `-d, --drop-cap` | 丢弃全部 capability（含 bounding set） |
+| `-t, --target PID` | 进入 PID 的 mount namespace |
+| `-M, -m, -mm, --mount-master` | 强制在全局 mount namespace 运行 |
+| `-i, --interactive` | 强制以调用者 uid 弹出提示 |
+| `-v, --version` / `-V` | 打印版本 / 版本号后退出 |
+| `-h, --help` | 帮助 |
+| `--require-existing-domain` | `-Z` 时校验上下文确实存在于当前策略（默认不校验） |
 
-所有包装器在首次启动时生成到 `workdir/bin/(getprop|setprop|resetprop|mount|chcon|restorecon)`,`workdir/.mnt/` 里的标记控制覆盖层开关。
+### `sudo`（前端）
 
-## 目录结构
+`sudo` 是换一种调用约定的 `su`：默认不切用户，支持 `-u USER`、`-v`（校验）、`-l`（列出策略）、`-k`（作废凭据）、`-E`（保留环境）、`-s`（登录 shell），全部翻译成 `su` 的选项，会话本身仍是普通 su。
 
-```
-aFakeSU/
-└--src/
-   ├--su.c                 # 主程序(fakesu + proot 启动参数 + 包装器生成)
-   ├--build_su.sh          # 只编译 su.c 并链接(enter.o/exit.o 见下)
-   ├--fakesu.elf           # 产物(ARM64 PIE,Android 24+)
-   ├--terhijack            # 会话上下文/ -Z 输出替换
-   ├--proot-termux/        # proot fork(enter.c/exit.c 手工 clang 编译)
-   ├--bash-5.3/            # 嵌入 shell
-   └--第三方/               # talloc + libandroid-shmem
-```
+### `afake-su`（启动器）
+
+经 rish 调用 `fakesu.elf` 的启动器，参数按 shell 引号规则拼接后转交。
+
+## 策略管理
+
+虚拟 root 若把 root 交给任何调用者，就既容易被识破、也不像真实实现，所以按 uid 维护一张策略表：
+
+| 命令 | 作用 |
+|------|------|
+| `su --policy-list` | 列出已存策略 |
+| `su --policy-set UID allow\|deny\|restrict\|query` | 设置某 uid 的策略 |
+| `su --policy-remove UID` | 删除（回到 `query`） |
+| `su --root-access prompt\|disabled\|adb-only\|apps-only` | 全局 root 授权模式 |
+| `su --multiuser owner-managed\|owner-only\|global` | 多用户模式 |
+
+## 我们劫持了什么
+
+全部在用户态完成，靠 proot 的 syscall 拦截（ptrace/seccomp）与包装器改写结果：
+
+- **uid / gid / 附加组**：`id`、`getuid/getgid/getgroups`、`/proc/<pid>/status`。
+- **capability**：`/proc/<pid>/status` 的 `Cap*` 行、`capget`。
+- **SELinux**：`id -Z`、`ls -Z`、`ps -Z`、`getenforce`、`/proc/<pid>/attr/*`，以及 `getxattr/listxattr` 的 `security.selinux`。默认 uid 0 → `u:r:virtu_su:s0`，其余按 AID 表映射，`-Z` 可覆盖为任意合法域。
+- **系统属性**：`getprop / setprop / resetprop` 包装器，键值持久化在 `<workdir>/.props`。
+- **分区写**：`/system`、`/vendor`、`/product`、`/odm`、`/` 的写操作重定向到 `<workdir>/ov/`，`stat` 仍报 `root:root` 与真实 mode/size。
+- **mount**：接受并记忆 `-o remount,rw/ro`，`mount` 输出按需改写。
+- **chcon / restorecon**：写入的标签存进 `<workdir>/.xattrs/`，`ls -Z` 据此显示；未覆盖路径与非覆盖查询走真实 xattr。
+- **/proc 视图**：`status`、`cmdline`、`comm`、`maps`、`attr`。
+- **身份边界**：只有 Vsud 及其子树是 `root` + `virtu_su`；设备其余进程与文件对象保留**真实**身份，祖先与无关进程不被伪造。
+
+## 架构
+
+- **Vsud**：按 uid 一份的常驻守护进程（抽象 Unix socket `afake_su_vsud.<uid>`）。会话由它 fork 出，因此 guest 的祖先是 root 身份的守护进程，而不是调用者 shell；调用 `su` 的那个 shell 在进程树里仍是真实的 `untrusted_app`/`shell`。
+- **会话**：客户端把 argv/env/stdio（可含 pty）经 `SCM_RIGHTS` 交给守护进程，守护进程再 `exec` 本二进制并去掉 `--vsud-session` 标记，走完整 su 流程。守护进程不可用时自动就地回退（`VSUD_NO_DAEMON=1` 可强制）。
+- **采集桥**：`rish` + `rish_shizuku.dex`（Shizuku）在设备上采集真实 uid/组/属性/SELinux 策略并缓存到 `<workdir>`。
+
+## 打包 / 发布
+
+发布包为 Termux（aarch64）deb，包内包含：
+
+- `fakesu.elf`（proot 静态内嵌的主二进制）
+- `rish`、`rishq`、`rish_shizuku.dex`、`facts.dex`（采集桥）
+- `libiconv.so`、`libncursesw.so.6.5`（嵌入 shell 所需的运行库）
+- `su`、`sudo` 包装器与 `afake-su` 启动器
+
+安装时用 `dpkg-divert` 把 termux-tools 的 `su` 与 sudo 的 `sudo` 改名到一边（不改装、不卸载），卸载时恢复。产物文件名带 **VirtualSU** 与版本号（如 `VirtualSU_2.0_aarch64.deb`）。
 
 ## 构建
 
-1. 重新编译 proot 改动(必须手工,`build_su.sh` 不编译这些):
-
-```bash
-cd src/proot-termux/src
-clang -O2 -fPIC -D_FILE_OFFSET_BITS=64 -D_GNU_SOURCE -DARG_MAX=131072 \
-      -DVERSION=\"5.1.0\" -DWITH_LIBANDROID_SHMEM -I. -I../include \
-      -c syscall/enter.c -o syscall/enter.o
-clang -O2 ... -c syscall/exit.c -o syscall/exit.o
-cd ../../ && bash build_su.sh
+```sh
+cd src && ./build_su.sh        # 全量编译 proot + su.c + vsud.c，链接出 fakesu.elf
 ```
 
-2. 部署:把 `fakesu.elf` 复制到 `/data/data/com.termux/files/usr/bin/fakesu.elf`,`/usr/bin/su` 用 shim 脚本(`#!/system/bin/sh\nexec .../fakesu.elf "$@"`)。
+构建脚本会从零编译 proot-termux 的全部 `.c`（不依赖残留 `.o`），并嵌入 `bash`、两个 `.so`、以及 `dex/` 下的采集资产。
 
-### ⚠ 已知限制
+## 已知限制
 
-- **不能把 ELF 改名为 `su`**:本机 Termux/安全策略对**任何**名为 `su` 的 ELF 拒绝执行(EPERM,脚本不受限),`/usr/bin/su` 必须保持 shim 脚本形式。其余名字(`fakesu.elf`、`suxx.elf`)均可执行。
-- `-c` 长脚本曾因 su.c 里包装串 `snprintf` 固定 1024 字节 + 格式串 10 个 `%s` 只有 9 个实参而截断/崩坏,已改为 `strlen(g_cmd)+1024` 容量并补齐实参。
-- 覆盖层**不**覆盖 `/data`;目录读操作保持真实 inode。
-- 套路始终骗不过 magisk 级深度检测。
-
-## 依赖
-
-- Android 7+ 沙箱环境 + Termux(shim 与 ELF 都必须在 termux 用户目录内执行)
-- Shizuku/Rish 用于提 shell 权限(降级模式则以当前用户运行)
+- **不是提权**：内核级 uid 0、真实 SELinux transition、真实父进程死亡语义都拿不到。深度检测（magisk 级）仍可识破。
+- 名为 `su` 的 **ELF** 在本机会被拒绝执行（EPERM），所以 `su` 只能是脚本包装器；其余名字（`fakesu.elf` 等）可执行。
+- 覆盖层**不**覆盖 `/data`；目录读操作保持真实 inode。
+- rish/uid 2000 读不到 Termux 私有目录，部署需经共享存储中转。
+- `/proc/version`、`/proc/sys/kernel/*`、`/proc/1` 在会话内可能仍被真实 SELinux + `hidepid` 拒绝。
