@@ -7,14 +7,14 @@ Priority: optional
 Maintainer: @httpspycharmhelpers
 Version: 1.2
 Homepage: https://github.com/httpspycharmhelpers/aFakeSU
-Description: A fake su implementation based on proot
- fakesu is a self-contained proot-based su: it statically embeds proot and
- only needs the system liblog/libdl, so no proot or root are required.
+Description: VirtualSU - a userspace fake-root sandbox based on proot
+ vsu is a self-contained proot-based fake su: it statically embeds proot and
+ only needs the system liblog/libdl, so no proot and no root are required. It
+ fakes a consistent root view (uid/gid/groups, capabilities, properties,
+ SELinux labels, /proc) at the syscall layer.
  The rish/rishq bridge harvests the device's real uid/group tables through
- Shizuku; when Shizuku is absent fakesu still runs, it just falls back to
- its built-in defaults. Requires the plain Termux app and aarch64.
+ Shizuku; when Shizuku is absent vsu still runs, it just falls back to its
+ built-in defaults. Requires the plain Termux app and aarch64.
  .
- This package takes over $PREFIX/bin/su (owned by termux-tools) and
- $PREFIX/bin/sudo (owned by sudo, when installed) with dpkg-divert, so the
- originals are renamed aside and restored on removal. Nothing is
- uninstalled to make room for it.
+ The package installs vsu and vsud and provides neither su nor sudo, so it
+ does not collide with termux-tools' su or the sudo package.

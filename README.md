@@ -6,7 +6,7 @@
 
 与 KernelSU / Magisk 的区别：本项目不模仿它们的实现，最大的特点是在 **SELinux / syscall 层做拦截与伪造**，且不隐藏自身。配套的 Vsud 守护进程把每次会话的祖先从调用者 shell 换成 root 身份的守护进程，让「谁在跑 root」这件事在进程树上也成立。
 
-> 产物二进制名为 `fakesu.elf`（本机对任何**名为 `su` 的 ELF** 会拒绝执行，所以 `su` 只能以脚本形式存在）。项目名 / 发布包名统一为 **VirtualSU**。
+> 源码构建产物名为 `fakesu.elf`；发布的 deb 把它安装为 **`vsu`**，守护进程入口为 **`vsud`**。本机对任何**名为 `su` 的 ELF** 会拒绝执行（EPERM），所以主二进制刻意不叫 `su`。项目名 / 发布包名统一为 **VirtualSU**。
 
 ## 快速开始
 
@@ -15,9 +15,9 @@
 **Termux（app uid 启动）**
 
 ```sh
-~/aFakeSU/src/fakesu.elf -c 'id; id -Z'      # 直接跑
-su -c 'id'                                    # 经包装器（安装 deb 后）
-sudo id                                       # sudo 前端
+~/aFakeSU/src/fakesu.elf -c 'id; id -Z'      # 从源码直接跑
+vsu -c 'id; id -Z'                            # 安装 deb 后（命令名 vsu）
+vsud                                          # 常驻守护进程（一般无需手动跑）
 ```
 
 **rish（uid 2000 / Shizuku）**
@@ -30,10 +30,10 @@ rish -c "/data/local/tmp/fakesu.elf -c 'id; id -Z'"
 
 ## 命令
 
-### `fakesu.elf`（`su` 的本体）
+### `vsu` / `fakesu.elf`（本体）
 
 ```
-su [选项] [-] [user [argument...]]
+vsu [选项] [-] [user [argument...]]
 ```
 
 | 选项 | 作用 |
@@ -55,13 +55,11 @@ su [选项] [-] [user [argument...]]
 | `-h, --help` | 帮助 |
 | `--require-existing-domain` | `-Z` 时校验上下文确实存在于当前策略（默认不校验） |
 
-### `sudo`（前端）
+### `vsud`（守护进程）
 
-`sudo` 是换一种调用约定的 `su`：默认不切用户，支持 `-u USER`、`-v`（校验）、`-l`（列出策略）、`-k`（作废凭据）、`-E`（保留环境）、`-s`（登录 shell），全部翻译成 `su` 的选项，会话本身仍是普通 su。
+`vsud` 就是 `vsu --vsud`：按 uid 一份的常驻守护进程，会话由它 fork 出（详见「架构」）。首个 `vsu` 调用会自动拉起它，通常不必手动执行。
 
-### `afake-su`（启动器）
-
-经 rish 调用 `fakesu.elf` 的启动器，参数按 shell 引号规则拼接后转交。
+> 发布包**不提供 `su` / `sudo`**，因此不会与 termux-tools 的 `su` 或 sudo 包冲突，也不需要 `dpkg-divert`。
 
 ## 策略管理
 
@@ -69,11 +67,11 @@ su [选项] [-] [user [argument...]]
 
 | 命令 | 作用 |
 |------|------|
-| `su --policy-list` | 列出已存策略 |
-| `su --policy-set UID allow\|deny\|restrict\|query` | 设置某 uid 的策略 |
-| `su --policy-remove UID` | 删除（回到 `query`） |
-| `su --root-access prompt\|disabled\|adb-only\|apps-only` | 全局 root 授权模式 |
-| `su --multiuser owner-managed\|owner-only\|global` | 多用户模式 |
+| `vsu --policy-list` | 列出已存策略 |
+| `vsu --policy-set UID allow\|deny\|restrict\|query` | 设置某 uid 的策略 |
+| `vsu --policy-remove UID` | 删除（回到 `query`） |
+| `vsu --root-access prompt\|disabled\|adb-only\|apps-only` | 全局 root 授权模式 |
+| `vsu --multiuser owner-managed\|owner-only\|global` | 多用户模式 |
 
 ## 我们劫持了什么
 
@@ -91,7 +89,7 @@ su [选项] [-] [user [argument...]]
 
 ## 架构
 
-- **Vsud**：按 uid 一份的常驻守护进程（抽象 Unix socket `afake_su_vsud.<uid>`）。会话由它 fork 出，因此 guest 的祖先是 root 身份的守护进程，而不是调用者 shell；调用 `su` 的那个 shell 在进程树里仍是真实的 `untrusted_app`/`shell`。
+- **Vsud**：按 uid 一份的常驻守护进程（抽象 Unix socket `afake_su_vsud.<uid>`）。会话由它 fork 出，因此 guest 的祖先是 root 身份的守护进程，而不是调用者 shell；调用 `vsu` 的那个 shell 在进程树里仍是真实的 `untrusted_app`/`shell`。
 - **会话**：客户端把 argv/env/stdio（可含 pty）经 `SCM_RIGHTS` 交给守护进程，守护进程再 `exec` 本二进制并去掉 `--vsud-session` 标记，走完整 su 流程。守护进程不可用时自动就地回退（`VSUD_NO_DAEMON=1` 可强制）。
 - **采集桥**：`rish` + `rish_shizuku.dex`（Shizuku）在设备上采集真实 uid/组/属性/SELinux 策略并缓存到 `<workdir>`。
 
@@ -99,12 +97,12 @@ su [选项] [-] [user [argument...]]
 
 发布包为 Termux（aarch64）deb，包内包含：
 
-- `fakesu.elf`（proot 静态内嵌的主二进制）
+- `vsu`（proot 静态内嵌的主二进制，即 `fakesu.elf` 改名）
+- `vsud`（守护进程入口，即 `vsu --vsud`）
 - `rish`、`rishq`、`rish_shizuku.dex`、`facts.dex`（采集桥）
 - `libiconv.so`、`libncursesw.so.6.5`（嵌入 shell 所需的运行库）
-- `su`、`sudo` 包装器与 `afake-su` 启动器
 
-安装时用 `dpkg-divert` 把 termux-tools 的 `su` 与 sudo 的 `sudo` 改名到一边（不改装、不卸载），卸载时恢复。产物文件名带 **VirtualSU** 与版本号（如 `VirtualSU_2.0_aarch64.deb`）。
+包内**不含 `su` / `sudo`**，安装不触碰 termux-tools 的 `su` 与 sudo 包，卸载也无需恢复任何文件。产物文件名带 **VirtualSU** 与版本号（如 `VirtualSU_2.0_aarch64.deb`）。
 
 ## 构建
 
@@ -117,7 +115,7 @@ cd src && ./build_su.sh        # 全量编译 proot + su.c + vsud.c，链接出 
 ## 已知限制
 
 - **不是提权**：内核级 uid 0、真实 SELinux transition、真实父进程死亡语义都拿不到。深度检测（magisk 级）仍可识破。
-- 名为 `su` 的 **ELF** 在本机会被拒绝执行（EPERM），所以 `su` 只能是脚本包装器；其余名字（`fakesu.elf` 等）可执行。
+- 名为 `su` 的 **ELF** 在本机会被拒绝执行（EPERM），这也是发布包把主二进制命名为 `vsu` 的原因；其余名字（`vsu`、`fakesu.elf` 等）可执行。
 - 覆盖层**不**覆盖 `/data`；目录读操作保持真实 inode。
 - rish/uid 2000 读不到 Termux 私有目录，部署需经共享存储中转。
 - `/proc/version`、`/proc/sys/kernel/*`、`/proc/1` 在会话内可能仍被真实 SELinux + `hidepid` 拒绝。

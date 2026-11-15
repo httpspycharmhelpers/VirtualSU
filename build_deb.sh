@@ -1,15 +1,16 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # Build the VirtualSU Termux (aarch64) deb.
 #
-# The package is still named "afake-su" internally (the maintainer scripts and
-# dpkg-divert calls reference that name), so only the produced archive is
-# branded VirtualSU.  Payload:
+# The package is still named "afake-su" internally, so only the produced
+# archive is branded VirtualSU.  The payload is self-branded: the binary ships
+# as "vsu", with "vsud" for the daemon.  It deliberately does NOT provide su or
+# sudo, so it never collides with termux-tools' su or the sudo package and
+# needs no dpkg-divert.  Payload:
 #
-#   bin/fakesu.elf        the proot-embedded su (self-contained)
-#   bin/fakesu            convenience name for the launcher
+#   bin/vsu               the proot-embedded su (self-contained)
+#   bin/vsud              the privilege anchor daemon (vsu --vsud)
 #   bin/{rish,rishq}      Shizuku bridge
 #   bin/{rish_shizuku.dex,facts.dex}
-#   bin/{su,sudo,afake-su} wrappers
 #   lib/afake-su/libiconv.so, libncursesw.so.6.5   runtime libs for the shell
 #
 # The binary already embeds the two .so files and the dex assets and writes
@@ -48,18 +49,15 @@ for s in preinst postinst prerm postrm; do
 done
 
 B="$STAGE/$PREFIXDIR/bin"
-cp -f src/fakesu.elf "$B/fakesu.elf"
-chmod 755 "$B/fakesu.elf"
-ln -sf fakesu.elf "$B/fakesu"
+cp -f src/fakesu.elf "$B/vsu"
+chmod 755 "$B/vsu"
 
 cp -f rish "$B/rish";   chmod 755 "$B/rish"
 cp -f rishq "$B/rishq"; chmod 755 "$B/rishq"
 cp -f rish_shizuku.dex "$B/rish_shizuku.dex"; chmod 644 "$B/rish_shizuku.dex"
 cp -f dex/facts.dex "$B/facts.dex";           chmod 644 "$B/facts.dex"
 
-cp -f packaging/su "$B/su";           chmod 755 "$B/su"
-cp -f packaging/sudo "$B/sudo";       chmod 755 "$B/sudo"
-cp -f packaging/afake-su "$B/afake-su"; chmod 755 "$B/afake-su"
+cp -f packaging/vsud "$B/vsud"; chmod 755 "$B/vsud"
 
 for so in libiconv.so libncursesw.so.6.5; do
 	cp -f "$SYS/lib/$so" "$STAGE/$PREFIXDIR/lib/afake-su/$so"

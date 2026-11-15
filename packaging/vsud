@@ -1,0 +1,14 @@
+#!/system/bin/sh
+# VirtualSU vsud - the privilege anchor daemon.
+#
+# vsud is the same binary as vsu, started in daemon mode: it listens on a
+# per-uid abstract socket and forks every session, so a guest's ancestry is a
+# root-owned daemon instead of the caller's shell.  Normally you never run it
+# by hand -- the first vsu call spawns it on demand -- but a wrapper makes it
+# a first-class command and keeps the socket's owner obvious in `ps`.
+D=/data/data/com.termux/files/usr/bin
+if [ -x "$D/vsu" ]; then
+  exec "$D/vsu" --vsud "$@"
+fi
+echo "vsud: vsu is missing; reinstall the package" >&2
+exit 1
