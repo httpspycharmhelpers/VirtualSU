@@ -699,40 +699,22 @@ static void emit_mount_wrapper(const char *ctx_path)
 }
 
 /*
- * chcon/restorecon: real root rewrites security.selinux labels; a fake
- * root records them into <workdir>/.xattrs/<path-with-'%'> which
- * enter.c replays for getxattr/lgetxattr (ls -Z) while the real
- * syscall keeps failing with EPERM.
+ * chcon/restorecon used to be shell wrappers that recorded labels themselves,
+ * which meant a bare "chcon" worked but /system/bin/chcon, busybox chcon and
+ * lsetfilecon() from a program did not.  enter.c now owns the write at the
+ * setxattr(2) boundary, so these are only PATH aliases of the real tools:
+ * every spelling reaches the same interception and the real exit status is
+ * preserved (an invalid context must fail, just like -Z rejects one).
  */
 static void emit_chcon_wrappers(const char *ctx_path)
 {
-	char xd[PATH_MAX];
 	char p[PATH_MAX];
-	snprintf(xd, sizeof(xd), "%s/.xattrs", g_work_dir);
+	FILE *f;
 
 	snprintf(p, sizeof(p), "%s/chcon", ctx_path);
-	FILE *f = fopen(p, "w");
+	f = fopen(p, "w");
 	if (f) {
-		fprintf(f,
-			"#!/system/bin/sh\n"
-			"X=\"%s\"\n"
-			"mkdir -p \"$X\"\n"
-			"ctx=; opts=1\n"
-			"for a in \"$@\"; do\n"
-			"  case \"$a\" in\n"
-			"    -*) : ;;\n"
-			"    *) if [ -z \"$ctx\" ]; then ctx=\"$a\"; else\n"
-			"         p=\"$a\"\n"
-			"         case \"$p\" in /*) ;; *) p=\"$PWD/$p\" ;; esac\n"
-			"         k=$(echo \"$p\" | sed 's#/#%%#g')\n"
-			"         case \"$k\" in %%*) k=${k#%%} ;; esac\n"
-			"         echo \"$ctx\" > \"$X/$k\"\n"
-			"       fi ;;\n"
-			"  esac\n"
-			"done\n"
-			"/system/bin/chcon \"$@\" >/dev/null 2>&1\n"
-			"exit 0\n",
-			xd);
+		fprintf(f, "#!/system/bin/sh\nexec /system/bin/chcon \"$@\"\n");
 		fclose(f);
 		chmod(p, 0755);
 	}
@@ -740,22 +722,7 @@ static void emit_chcon_wrappers(const char *ctx_path)
 	snprintf(p, sizeof(p), "%s/restorecon", ctx_path);
 	f = fopen(p, "w");
 	if (f) {
-		fprintf(f,
-			"#!/system/bin/sh\n"
-			"X=\"%s\"\n"
-			"for a in \"$@\"; do\n"
-			"  case \"$a\" in\n"
-			"    -*) : ;;\n"
-			"    *) p=\"$a\"\n"
-			"       case \"$p\" in /*) ;; *) p=\"$PWD/$p\" ;; esac\n"
-			"       k=$(echo \"$p\" | sed 's#/#%%#g')\n"
-			"       case \"$k\" in %%*) k=${k#%%} ;; esac\n"
-			"       rm -f \"$X/$k\" ;;\n"
-			"  esac\n"
-			"done\n"
-			"/system/bin/restorecon \"$@\" >/dev/null 2>&1\n"
-			"exit 0\n",
-			xd);
+		fprintf(f, "#!/system/bin/sh\nexec /system/bin/restorecon \"$@\"\n");
 		fclose(f);
 		chmod(p, 0755);
 	}

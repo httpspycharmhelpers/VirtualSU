@@ -21,6 +21,7 @@
  */
 
 #include <errno.h>       /* errno(3), E* */
+#include <ctype.h>       /* isalnum, isdigit */
 
 /* Supplied by su.c: the session's --drop-cap choice. */
 extern int g_drop_cap;
@@ -1316,6 +1317,184 @@ answer:
 	 * the result register can be repaired there if the kernel overwrites it. */
 	tracee->sysexit_pending = true;
 	tracee->restart_how = PTRACE_SYSCALL;
+	return true;
+}
+
+/*
+ * chcon writes a file label through setxattr(2).  A PATH-only wrapper misses
+ * /system/bin/chcon, busybox chcon, and any program that calls lsetfilecon()
+ * or setxattr() itself, so the write is taken at the syscall boundary.
+ *
+ * File contexts wear object_r (process contexts wear r); both are accepted so
+ * one shape rule serves chcon and -Z.  The type is never matched against the
+ * device policy -- the store is a declaration, not a lookup -- but a bare
+ * token or a truncated label is refused with EINVAL, just like -Z.
+ */
+static bool afakesu_ctx_syntax_ok(const char *ctx)
+{
+	const char *p;
+
+	if (strncmp(ctx, "u:r:", 4) == 0)
+		p = ctx + 4;
+	else if (strncmp(ctx, "u:object_r:", 11) == 0)
+		p = ctx + 11;
+	else
+		return false;
+	if (!(isalnum((unsigned char) *p) || *p == '_'))
+		return false;
+	while (isalnum((unsigned char) *p) || *p == '_')
+		p++;
+	if (strncmp(p, ":s0", 3) != 0)
+		return false;
+	p += 3;
+	if (*p == '\0')
+		return true;
+	if (*p != ':')
+		return false;
+	p++;
+	for (;;) {
+		if (*p != 'c' || !isdigit((unsigned char) *(p + 1)))
+			return false;
+		p += 2;
+		while (isdigit((unsigned char) *p))
+			p++;
+		if (*p == '\0')
+			return true;
+		if (*p != ',')
+			return false;
+		p++;
+	}
+}
+
+/* A label without MLS categories borrows the session's own categories: a
+ * file owned by an app should carry the app's category pair, not a bare s0.
+ * An explicit :c... in the supplied context always wins. */
+static const char *afakesu_ctx_ensure_mcs(const char *ctx, char *out, size_t cap)
+{
+	const char *sess;
+	const char *cat;
+
+	if (strstr(ctx, ":s0:c") != NULL)
+		return ctx;
+	sess = afakesu_read_session_ctx();
+	if (sess == NULL)
+		return ctx;
+	cat = strstr(sess, ":s0:c");
+	if (cat == NULL)
+		return ctx;
+	cat += 3; /* skip ":s0", keep ":c124,c257,..." */
+	snprintf(out, cap, "%s%s", ctx, cat);
+	return out;
+}
+
+/* Record (or, with value == NULL, forget) a label under the canonical guest
+ * path, the same key afakesu_forge_xattr() reads back for ls -Z. */
+static void afakesu_xattr_record(Tracee *tracee, const char *path, const char *value)
+{
+	char cpath[PATH_MAX];
+	const char *lookup = path;
+	char key[PATH_MAX];
+	char sp[PATH_MAX];
+	FILE *f;
+
+	if (path[0] == '/') {
+		if (canonicalize(tracee, path, false, cpath, 0) >= 0) {
+			chop_finality(cpath);
+			lookup = cpath;
+		}
+	} else if (getcwd2(tracee, cpath) >= 0
+		   && canonicalize(tracee, path, false, cpath, 0) >= 0) {
+		chop_finality(cpath);
+		lookup = cpath;
+	}
+
+	afakesu_xattr_store_key(key, sizeof(key), lookup);
+	if (snprintf(sp, sizeof(sp), "%s/.xattrs", g_work_dir) <= 0)
+		return;
+	if (value != NULL)
+		mkdir(sp, 0755);
+	if (snprintf(sp, sizeof(sp), "%s/.xattrs/%s", g_work_dir, key) <= 0)
+		return;
+	if (value == NULL) {
+		unlink(sp);
+		return;
+	}
+	f = fopen(sp, "w");
+	if (f == NULL)
+		return;
+	fprintf(f, "%s\n", value);
+	fclose(f);
+}
+
+static bool afakesu_forge_setxattr(Tracee *tracee, word_t syscall_number)
+{
+	char path[PATH_MAX];
+	char name[64];
+	char val[512];
+	char norm[256];
+	const char *ctx;
+	word_t name_addr, val_addr, size;
+	word_t result = 0;
+	ssize_t n;
+	bool removing = false;
+
+	switch (syscall_number) {
+	case PR_setxattr:
+	case PR_lsetxattr:
+	case PR_fsetxattr:
+		break;
+	case PR_removexattr:
+	case PR_lremovexattr:
+	case PR_fremovexattr:
+		removing = true;
+		break;
+	default:
+		return false;
+	}
+
+	if (afakesu_xattr_is_fd(syscall_number)) {
+		if (!afakesu_fd_to_guest(tracee, (int) peek_reg(tracee, ORIGINAL, SYSARG_1),
+					path, sizeof(path)))
+			return false;
+	} else if (get_sysarg_path(tracee, path, SYSARG_1) < 0)
+		return false;
+
+	name_addr = peek_reg(tracee, ORIGINAL, SYSARG_2);
+	if (name_addr == 0 || read_string(tracee, name, name_addr, sizeof(name) - 1) < 0)
+		return false;
+	if (strcmp(name, "security.selinux") != 0)
+		return false;
+
+	if (removing) {
+		afakesu_xattr_record(tracee, path, NULL);
+	} else {
+		val_addr = peek_reg(tracee, ORIGINAL, SYSARG_3);
+		size = peek_reg(tracee, ORIGINAL, SYSARG_4);
+		if (val_addr == 0 || size == 0 || size >= sizeof(val))
+			return false;
+		n = read_data(tracee, val, val_addr, size);
+		if (n < 0)
+			return false;
+		val[size] = '\0';
+		if (getenv("THJ_PDBG"))
+			fprintf(stderr, "THJP sx raw=%llu addr=%llx size=%llu n=%zd value=[%s]\n",
+				(unsigned long long) peek_reg(tracee, ORIGINAL, SYSARG_NUM),
+				(unsigned long long) val_addr, (unsigned long long) size,
+				n, val);
+		if (!afakesu_ctx_syntax_ok(val)) {
+			result = (word_t) -EINVAL;
+		} else {
+			ctx = afakesu_ctx_ensure_mcs(val, norm, sizeof(norm));
+			afakesu_xattr_record(tracee, path, ctx);
+			if (getenv("THJ_PDBG"))
+				fprintf(stderr, "THJP sx store path=%s ctx=%s\n", path, ctx);
+		}
+	}
+
+	/* The kernel would answer EPERM; a voided syscall keeps the result
+	 * poked here (translate_syscall_exit restores it for PR_void). */
+	poke_reg(tracee, SYSARG_RESULT, result);
+	set_sysnum(tracee, PR_void);
 	return true;
 }
 
@@ -3053,6 +3232,7 @@ int translate_syscall_enter(Tracee *tracee)
 		}
 	}
 	if (!afakesu_forge_xattr(tracee, syscall_number)
+	 && !afakesu_forge_setxattr(tracee, syscall_number)
 	 && !afakesu_forge_capabilities(tracee, syscall_number)) {
 	afakesu_redirect_proc1(tracee, syscall_number);
 	switch (syscall_number) {

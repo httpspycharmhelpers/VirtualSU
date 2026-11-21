@@ -83,7 +83,7 @@ vsu [选项] [-] [user [argument...]]
 - **系统属性**：`getprop / setprop / resetprop` 包装器，键值持久化在 `<workdir>/.props`。
 - **分区写**：`/system`、`/vendor`、`/product`、`/odm`、`/` 的写操作重定向到 `<workdir>/ov/`，`stat` 仍报 `root:root` 与真实 mode/size。
 - **mount**：接受并记忆 `-o remount,rw/ro`，`mount` 输出按需改写。
-- **chcon / restorecon**：写入的标签按**规范化后的绝对路径**存进 `<workdir>/.xattrs/`，`ls -Z` 据此显示（相对/绝对写法指向同一文件时命中同一条）；未覆盖路径与非覆盖查询走真实 xattr。
+- **chcon / restorecon**：在 `setxattr/lsetxattr/fsetxattr(security.selinux)` 系统调用边界接管，因此 `/system/bin/chcon`、`busybox chcon` 与程序内直接调用 `lsetfilecon()` 都走同一条路径；`removexattr` 删除记录。标签按**规范化后的绝对路径**存进 `<workdir>/.xattrs/`，`ls -Z` 据此显示（相对/绝对写法指向同一文件时命中同一条）。上下文须与 `-Z` 一样语法合法（`u:object_r:<type>:s0[:c<N>,...]`，type 不校验是否存在），非法值返回 `EINVAL`；未显式携带 MLS category 时自动补上当前会话的 category（app uid 按其 AID 派生，如 `:c137,c257,c512,c768`）。未覆盖路径与非覆盖查询走真实 xattr。
 - **/proc 视图**：`status`、`cmdline`、`comm`、`maps`、`attr`。
 - **身份边界**：只有 Vsud 及其子树是 `root` + `virtu_su`；设备其余进程与文件对象保留**真实**身份，祖先与无关进程不被伪造。
 
