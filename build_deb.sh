@@ -23,12 +23,13 @@ umask 022
 cd "$(dirname "$0")"
 ROOT="$(pwd)"
 PKG=afake-su
-VER="${VIRTUALSU_VERSION:-2.0}"
+VER="${VIRTUALSU_VERSION:-2.1}"
 ARCH=aarch64
 PREFIXDIR="data/data/com.termux/files/usr"
 STAGE="$ROOT/build/deb/stage"
 OUT="$ROOT/dist"
-NAME="VirtualSU_${VER}_${ARCH}.deb"
+BIN_MD5="$(md5sum src/fakesu.elf | awk '{print $1}')"
+NAME="VirtualSU_${VER}_${ARCH}_${BIN_MD5:0:12}.deb"
 SYS=/data/data/com.termux/files/usr
 
 [ -f src/fakesu.elf ] || { echo "build src/fakesu.elf first" >&2; exit 1; }
@@ -73,6 +74,7 @@ fi
 
 echo
 echo "== built $OUT/$NAME =="
+echo "binary md5: $BIN_MD5"
 dpkg-deb -I "$OUT/$NAME"
 echo "== payload =="
 dpkg-deb -c "$OUT/$NAME" | awk '{print $1, $2, $6}'

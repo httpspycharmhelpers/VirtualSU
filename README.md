@@ -102,7 +102,14 @@ vsu [选项] [-] [user [argument...]]
 - `rish`、`rishq`、`rish_shizuku.dex`、`facts.dex`（采集桥）
 - `libiconv.so`、`libncursesw.so.6.5`（嵌入 shell 所需的运行库）
 
-包内**不含 `su` / `sudo`**，安装不触碰 termux-tools 的 `su` 与 sudo 包，卸载也无需恢复任何文件。产物文件名带 **VirtualSU** 与版本号（如 `VirtualSU_2.0_aarch64.deb`）。
+包内**不含 `su` / `sudo`**，安装不触碰 termux-tools 的 `su` 与 sudo 包，卸载也无需恢复任何文件。产物文件名带 **VirtualSU**、版本号、架构与二进制 MD5 前 12 位（如 `VirtualSU_2.1_aarch64_ec3749942a4e.deb`），发布记录同时保存完整哈希与存储路径。
+
+### 发布记录
+
+| 版本 | 文件 | 存储位置 | 二进制 MD5 | deb MD5 | deb SHA256 |
+| --- | --- | --- | --- | --- | --- |
+| 2.1（最新） | `VirtualSU_2.1_aarch64_ec3749942a4e.deb` | `dist/`、`/storage/emulated/0/termux/` | `ec3749942a4eeb4da716ede3304b5aa5` | `f728f250786273b31b49f2093e6d90a9` | `01d24c26f519f40788ca5bcc60735e3d568f58adb6bdf19000d380dd84a9d4e5` |
+| 2.0 | `VirtualSU_2.0_aarch64.deb` | `dist/` | `ec3749942a4eeb4da716ede3304b5aa5` | `435bd2c99f2cba63bee5670d13531026` | `461949ef061d0d6a2bccd7894f8c7c88a4265674fd91f9172f8002348fcc3f7b` |
 
 ## 构建
 
