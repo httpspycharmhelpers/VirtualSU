@@ -4682,6 +4682,32 @@ static void parse_options(int argc, char **argv)
 		g_pos[g_pos_cnt++] = a;
 	}
 }
+
+static void add_app_oem_groups(void)
+{
+	long gids[4];
+
+	if (g_uid < 10000 || g_uid > 0x7fffffffL - 40000)
+		return;
+	gids[0] = 9997;
+	gids[1] = g_uid + 10000;
+	gids[2] = g_uid + 40000;
+	gids[3] = 99909997;
+	for (size_t i = 0; i < 4; i++) {
+		bool present = (gids[i] == g_gid);
+		for (size_t k = 0; !present && k < g_suppg_cnt; k++) {
+			long v;
+			if (valid_uint_str(g_suppg[k], &v) && v == gids[i])
+				present = true;
+		}
+		if (present || g_suppg_cnt >= SUPP_GID_MAX)
+			continue;
+		char num[32];
+		snprintf(num, sizeof(num), "%ld", gids[i]);
+		g_suppg[g_suppg_cnt++] = strdup(num);
+	}
+}
+
 int main(int argc, char **argv)
 {
 	/* Vsud dispatch has to happen before anything else touches the session:
@@ -4903,6 +4929,7 @@ int main(int argc, char **argv)
 		user = g_user_opt;
 	}
 	parse_user_and_groups(user);
+	bool explicit_groups = (g_grp != NULL || g_suppg_cnt > 0);
 	if (g_uid < 0) {
 		g_uid = 2000;
 		g_gid = 2000;
@@ -5135,6 +5162,8 @@ int main(int argc, char **argv)
 			}
 		}
 	}
+	if (!explicit_groups)
+		add_app_oem_groups();
 	/* Publish the resolved supplementary groups for enter.c, which
 	 * rewrites /proc/<pid>/status in the tracee and cannot ask Package
 	 * Manager itself: by then the bridge is closed and the tracee runs
@@ -5167,6 +5196,27 @@ int main(int argc, char **argv)
 			FILE *gf = fopen(gt, "w");
 			if (gf == NULL)
 				continue;
+			FILE *old = fopen(gp, "r");
+			if (old != NULL) {
+				char line[4096];
+				while (fgets(line, sizeof(line), old) != NULL) {
+					const char *colon = strchr(line, ':');
+					if (colon != NULL) {
+						char uids[64];
+						size_t un = (size_t)(colon - line);
+						if (un < sizeof(uids)) {
+							memcpy(uids, line, un);
+							uids[un] = '\0';
+							char *end;
+							long cu = strtol(uids, &end, 10);
+							if (uids[0] != '\0' && *end == '\0' && cu == g_uid)
+								continue;
+						}
+					}
+					fputs(line, gf);
+				}
+				fclose(old);
+			}
 			fprintf(gf, "%ld:%d", g_uid, g_groups_src);
 			if (g_suppg_cnt > 0)
 				fprintf(gf, " %s", g_suppg[0]);
